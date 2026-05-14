@@ -1,6 +1,6 @@
 # KCS 2.4 Kubernetes Pre-Installation Checker
 
-`kcs_k8s_check.sh` verifies that a Kubernetes cluster meets all prerequisites for installing **Kaspersky Container Security 2.4** before you run `helm install`. It is fully read-only — the only temporary resources it creates (a test PVC and a registry-probe pod, both in namespace `default`) are deleted automatically on exit.
+`kcs_k8s_check.sh` verifies that a Kubernetes cluster meets all prerequisites for installing **Kaspersky Container Security 2.4** before you run `helm install`. The script checks permissions by creating temporary resources: a test PVC and a registry-probe pod, both in namespace `default`, which are deleted automatically on exit.
 
 ## Requirements
 

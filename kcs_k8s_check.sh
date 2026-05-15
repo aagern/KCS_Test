@@ -168,14 +168,17 @@ gather_inputs() {
 check_k8s_version() {
   print_header "A. Kubernetes version"
 
-  local ver_json minor arch_list fail=0 detail=""
+  local minor arch_list fail=0 detail=""
+  local major minor_raw ver_json
 
-  ver_json=$(kubectl version --output=json 2>/dev/null)
-  local major minor_raw
-  major=$(echo "$ver_json" | python3 -c \
-    "import sys,json; v=json.load(sys.stdin)['serverVersion']; print(v['major'])" 2>/dev/null) || major="?"
-  minor_raw=$(echo "$ver_json" | python3 -c \
-    "import sys,json; v=json.load(sys.stdin)['serverVersion']; print(v['minor'])" 2>/dev/null) || minor_raw="?"
+  ver_json=$(kubectl version --output=json 2>/dev/null) || true
+  # Parse serverVersion from JSON using grep+sed — no python3 required
+  major=$(printf '%s\n' "$ver_json" | grep -A20 '"serverVersion"' | grep '"major"' | head -1 \
+    | sed 's/[^0-9]*\([0-9]*\).*/\1/')
+  minor_raw=$(printf '%s\n' "$ver_json" | grep -A20 '"serverVersion"' | grep '"minor"' | head -1 \
+    | sed 's/.*"minor"[^"]*"\([^"]*\)".*/\1/')
+  [[ -z "$major" ]]     && major="?"
+  [[ -z "$minor_raw" ]] && minor_raw="?"
   # strip non-numeric suffix ("28+" → "28")
   minor="${minor_raw//[^0-9]/}"
 

@@ -1,6 +1,6 @@
 # KCS 2.4 Kubernetes Pre-Installation Checker
 
-`kcs_k8s_check.sh` verifies that a Kubernetes cluster meets all prerequisites for installing **Kaspersky Container Security 2.4** before you run `helm install`. It is fully read-only — the only temporary resources it creates (a test PVC and a registry-probe pod, both in namespace `default`) are deleted automatically on exit.
+`kcs_k8s_check.sh` verifies that a Kubernetes cluster meets all prerequisites for installing **Kaspersky Container Security 2.4** before you run `helm install`. Temporary resources created during the check (a test PVC, a registry-probe pod, and per-node eBPF-check pods — all in namespace `default`) are deleted automatically on exit.
 
 ## Requirements
 
@@ -73,7 +73,7 @@ REGISTRY_TEST_IMAGE=alpine \
 
 ## Checks performed
 
-| ID | Check | Threshold |
+| ID | Check | Threshold / Requirement |
 |---|---|---|
 | A | Kubernetes server version | ≥ 1.21, all nodes `amd64` |
 | B | Allocatable CPU across all nodes | ≥ 10 cores |
@@ -82,8 +82,22 @@ REGISTRY_TEST_IMAGE=alpine \
 | E | Ingress controller | At least one `IngressClass` resource exists |
 | F | DNS resolution for `DOMAIN` | Domain resolves; warns (not fails) if not yet configured |
 | G | Registry reachability (`repo.kcs.kaspersky.com`) | HTTP 2xx/3xx/401/403 from inside the cluster |
+| H | OS distribution and kernel version | Kernel ≥ 4.18 on every node (FAIL if below); kernel < 5.8 triggers a WARN (kcs-ih must run in privileged mode) |
+| I | eBPF capabilities — BTF support | `/sys/kernel/btf/vmlinux` must exist on every node (`CONFIG_DEBUG_INFO_BTF=y`), required for eBPF CO-RE used by KCS agents |
 
 Checks F and G are skipped when `DOMAIN` is empty or `SKIP_*` flags are set.
+
+### Notes on checks H and I
+
+**Check H — kernel version** reads `nodeInfo.kernelVersion` directly from the Kubernetes API — no SSH required. Two thresholds apply:
+
+- **< 4.18** → **FAIL** — KCS agents cannot run at all.
+- **≥ 4.18 and < 5.8** → **WARN** — KCS works but the `kcs-ih` component must be configured with `privileged: true`.
+- **≥ 5.8** → **PASS** — full support, no extra configuration needed.
+
+**Check I — eBPF BTF** deploys a short-lived privileged `busybox` pod on each node (via `nodeName` scheduling) that checks whether `/sys/kernel/btf/vmlinux` exists on the host. This file is present when the kernel was compiled with `CONFIG_DEBUG_INFO_BTF=y`, which is required for the eBPF CO-RE technology used by KCS node agents. The pod is deleted immediately after the check regardless of outcome.
+
+Most modern distributions (Ubuntu 20.04+, RHEL 9, Debian 11+, Astra Linux SE 1.7) ship kernels with BTF enabled by default. If BTF is absent, KCS will attempt a fallback compatibility mode, but full runtime monitoring functionality may be limited.
 
 ## Output
 
@@ -111,4 +125,4 @@ The report contains the measured value, threshold, status, and raw `kubectl` out
 bash kcs_k8s_check_test.sh --kubeconfig=/path/to/kubeconfig.yaml
 ```
 
-The test suite runs unit tests (normalization helpers, mock-kubectl pass/fail cases, python3-absence check) and integration tests against a real cluster. All 36 tests must pass.
+The test suite runs unit tests (normalization helpers, kernel version parsing, mock-kubectl pass/fail cases, python3-absence check) and integration tests against a real cluster. All 52 tests must pass.

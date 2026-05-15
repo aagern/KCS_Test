@@ -11,6 +11,8 @@ KUBECONFIG_ARG=""
 INTEGRATION_EXTERNAL_DB=""
 INTEGRATION_EXTERNAL_DB_USER="postgres"
 INTEGRATION_EXTERNAL_DB_PASSWORD=""
+INTEGRATION_VAULT_HOST=""
+INTEGRATION_VAULT_ACCOUNT=""
 
 for _arg in "$@"; do
   case "$_arg" in
@@ -18,6 +20,8 @@ for _arg in "$@"; do
     --external-db=*) INTEGRATION_EXTERNAL_DB="${_arg#*=}";;
     --external-db-user=*) INTEGRATION_EXTERNAL_DB_USER="${_arg#*=}";;
     --external-db-password=*) INTEGRATION_EXTERNAL_DB_PASSWORD="${_arg#*=}";;
+    --vault=*) INTEGRATION_VAULT_HOST="${_arg#*=}";;
+    --vault-account=*) INTEGRATION_VAULT_ACCOUNT="${_arg#*=}";;
     --kubeconfig) ;; # handled as next arg below — not currently needed
     *) echo "Unknown test arg: $_arg" >&2;;
   esac
@@ -503,6 +507,236 @@ fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""
+echo "━━━ Unit tests: check_vault ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+  _t "parse_args: --vault sets VAULT_HOST" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    VAULT_HOST=""
+    parse_args --vault 10.160.6.210
+    [[ "$VAULT_HOST" == "10.160.6.210" ]]
+  '
+
+  _t "parse_args: --vault-account sets VAULT_ACCOUNT_FILE" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    VAULT_ACCOUNT_FILE=""
+    parse_args --vault-account /tmp/test.key
+    [[ "$VAULT_ACCOUNT_FILE" == "/tmp/test.key" ]]
+  '
+
+  _t "check_vault skips (PASS) when VAULT_HOST not set" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    VAULT_HOST=""
+    kubectl() { echo "mock"; }
+    export -f kubectl
+    check_vault
+  '
+
+  _t "check_vault FAILS when VAULT_ACCOUNT_FILE not specified" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    VAULT_HOST="10.160.6.210"
+    VAULT_ACCOUNT_FILE=""
+    kubectl() { echo "mock"; }
+    export -f kubectl
+    ! check_vault
+  '
+
+  _t "check_vault FAILS when VAULT_ACCOUNT_FILE does not exist" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    VAULT_HOST="10.160.6.210"
+    VAULT_ACCOUNT_FILE="/tmp/nonexistent_kcs_vault_xyz_12345.key"
+    kubectl() { echo "mock"; }
+    export -f kubectl
+    ! check_vault
+  '
+
+  _t "check_vault FAILS when key file has no VAULT_TOKEN" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    tmpf=$(mktemp /tmp/vault-XXXX.key)
+    echo "VAULT_ADDR=http://10.0.0.1:8200" > "$tmpf"
+    VAULT_HOST="10.0.0.1"; VAULT_ACCOUNT_FILE="$tmpf"
+    kubectl() { echo "mock"; }
+    export -f kubectl
+    result=0; check_vault || result=$?
+    rm -f "$tmpf"
+    [[ $result -ne 0 ]]
+  '
+
+  _t "check_vault PASSES when pod reports VAULT_OK" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    tmpf=$(mktemp /tmp/vault-XXXX.key)
+    printf "VAULT_ADDR=http://10.0.0.1:8200\nVAULT_TOKEN=test_token_xyz\n" > "$tmpf"
+    VAULT_HOST="10.0.0.1"; VAULT_ACCOUNT_FILE="$tmpf"
+    kubectl() {
+      case "$*" in
+        *"apply -f"*)                       echo "pod/kcs-precheck-vault created";;
+        *"get pod"*"kcs-precheck-vault"*)   echo "Succeeded";;
+        *"logs"*"kcs-precheck-vault"*)      echo "VAULT_OK";;
+        *"delete pod"*)                     echo "pod deleted";;
+        *)                                  echo "mock";;
+      esac
+    }
+    export -f kubectl
+    check_vault; rc=$?
+    rm -f "$tmpf"; exit $rc
+  '
+
+  _t "check_vault FAILS when pod reports VAULT_UNREACHABLE" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    tmpf=$(mktemp /tmp/vault-XXXX.key)
+    printf "VAULT_ADDR=http://10.0.0.1:8200\nVAULT_TOKEN=test_token_xyz\n" > "$tmpf"
+    VAULT_HOST="10.0.0.1"; VAULT_ACCOUNT_FILE="$tmpf"
+    kubectl() {
+      case "$*" in
+        *"apply -f"*)                       echo "pod/kcs-precheck-vault created";;
+        *"get pod"*"kcs-precheck-vault"*)   echo "Succeeded";;
+        *"logs"*"kcs-precheck-vault"*)      echo "VAULT_UNREACHABLE";;
+        *"delete pod"*)                     echo "pod deleted";;
+        *)                                  echo "mock";;
+      esac
+    }
+    export -f kubectl
+    result=0; check_vault || result=$?
+    rm -f "$tmpf"; [[ $result -ne 0 ]]
+  '
+
+  _t "check_vault FAILS when pod reports VAULT_SEALED" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    tmpf=$(mktemp /tmp/vault-XXXX.key)
+    printf "VAULT_ADDR=http://10.0.0.1:8200\nVAULT_TOKEN=test_token_xyz\n" > "$tmpf"
+    VAULT_HOST="10.0.0.1"; VAULT_ACCOUNT_FILE="$tmpf"
+    kubectl() {
+      case "$*" in
+        *"apply -f"*)                       echo "pod/kcs-precheck-vault created";;
+        *"get pod"*"kcs-precheck-vault"*)   echo "Succeeded";;
+        *"logs"*"kcs-precheck-vault"*)      echo "VAULT_SEALED";;
+        *"delete pod"*)                     echo "pod deleted";;
+        *)                                  echo "mock";;
+      esac
+    }
+    export -f kubectl
+    result=0; check_vault || result=$?
+    rm -f "$tmpf"; [[ $result -ne 0 ]]
+  '
+
+  _t "check_vault FAILS when pod reports VAULT_AUTH_FAIL" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    tmpf=$(mktemp /tmp/vault-XXXX.key)
+    printf "VAULT_ADDR=http://10.0.0.1:8200\nVAULT_TOKEN=test_token_xyz\n" > "$tmpf"
+    VAULT_HOST="10.0.0.1"; VAULT_ACCOUNT_FILE="$tmpf"
+    kubectl() {
+      case "$*" in
+        *"apply -f"*)                       echo "pod/kcs-precheck-vault created";;
+        *"get pod"*"kcs-precheck-vault"*)   echo "Succeeded";;
+        *"logs"*"kcs-precheck-vault"*)      echo "VAULT_AUTH_FAIL";;
+        *"delete pod"*)                     echo "pod deleted";;
+        *)                                  echo "mock";;
+      esac
+    }
+    export -f kubectl
+    result=0; check_vault || result=$?
+    rm -f "$tmpf"; [[ $result -ne 0 ]]
+  '
+
+  _t "check_vault WARNS when pod times out" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    tmpf=$(mktemp /tmp/vault-XXXX.key)
+    printf "VAULT_ADDR=http://10.0.0.1:8200\nVAULT_TOKEN=test_token_xyz\n" > "$tmpf"
+    VAULT_HOST="10.0.0.1"; VAULT_ACCOUNT_FILE="$tmpf"
+    VAULT_CHECK_TIMEOUT=0
+    kubectl() {
+      case "$*" in
+        *"apply -f"*)   echo "pod/kcs-precheck-vault created";;
+        *"delete pod"*) echo "pod deleted";;
+        *)              echo "mock";;
+      esac
+    }
+    export -f kubectl
+    check_vault; rc=$?
+    rm -f "$tmpf"; exit $rc
+  '
+
+  _t "check_vault FAILS with network message when pod reports VAULT_UNREACHABLE" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    tmpf=$(mktemp /tmp/vault-XXXX.key)
+    printf "VAULT_ADDR=http://10.0.0.1:8200\nVAULT_TOKEN=test_token_xyz\n" > "$tmpf"
+    VAULT_HOST="10.0.0.1"; VAULT_ACCOUNT_FILE="$tmpf"
+    kubectl() {
+      case "$*" in
+        *"apply -f"*)                       echo "pod created";;
+        *"get pod"*"kcs-precheck-vault"*)   echo "Succeeded";;
+        *"logs"*"kcs-precheck-vault"*)      echo "VAULT_UNREACHABLE";;
+        *"delete pod"*)                     echo "pod deleted";;
+        *)                                  echo "mock";;
+      esac
+    }
+    export -f kubectl
+    output=$(check_vault 2>&1); rc=$?
+    rm -f "$tmpf"
+    [[ $rc -ne 0 ]] && echo "$output" | grep -qi "unreachable\|network\|port"
+  '
+
+  _t "check_vault FAILS with sealed message when pod reports VAULT_SEALED" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    tmpf=$(mktemp /tmp/vault-XXXX.key)
+    printf "VAULT_ADDR=http://10.0.0.1:8200\nVAULT_TOKEN=test_token_xyz\n" > "$tmpf"
+    VAULT_HOST="10.0.0.1"; VAULT_ACCOUNT_FILE="$tmpf"
+    kubectl() {
+      case "$*" in
+        *"apply -f"*)                       echo "pod created";;
+        *"get pod"*"kcs-precheck-vault"*)   echo "Succeeded";;
+        *"logs"*"kcs-precheck-vault"*)      echo "VAULT_SEALED";;
+        *"delete pod"*)                     echo "pod deleted";;
+        *)                                  echo "mock";;
+      esac
+    }
+    export -f kubectl
+    output=$(check_vault 2>&1); rc=$?
+    rm -f "$tmpf"
+    [[ $rc -ne 0 ]] && echo "$output" | grep -qi "seal"
+  '
+
+  _t "check_vault FAILS with auth message when pod reports VAULT_AUTH_FAIL" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    tmpf=$(mktemp /tmp/vault-XXXX.key)
+    printf "VAULT_ADDR=http://10.0.0.1:8200\nVAULT_TOKEN=test_token_xyz\n" > "$tmpf"
+    VAULT_HOST="10.0.0.1"; VAULT_ACCOUNT_FILE="$tmpf"
+    kubectl() {
+      case "$*" in
+        *"apply -f"*)                       echo "pod created";;
+        *"get pod"*"kcs-precheck-vault"*)   echo "Succeeded";;
+        *"logs"*"kcs-precheck-vault"*)      echo "VAULT_AUTH_FAIL";;
+        *"delete pod"*)                     echo "pod deleted";;
+        *)                                  echo "mock";;
+      esac
+    }
+    export -f kubectl
+    output=$(check_vault 2>&1); rc=$?
+    rm -f "$tmpf"
+    [[ $rc -ne 0 ]] && echo "$output" | grep -qi "auth\|token\|credential"
+  '
+
+  _setup_mock_kubectl
+else
+  echo "  ⚠️  Skipped (script not found)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
 echo "━━━ Integration tests: real cluster ($KUBECONFIG_ARG) ━━━━━━━━━━━━━━━━━"
 
 if [[ -z "$KUBECONFIG_ARG" ]]; then
@@ -714,6 +948,42 @@ PODSPEC
     "
   else
     echo "  ⚠️  External PostgreSQL tests skipped (pass --external-db=HOST --external-db-user=USER --external-db-password=PASS)"
+  fi
+
+  if [[ -n "$INTEGRATION_VAULT_HOST" && -n "$INTEGRATION_VAULT_ACCOUNT" ]]; then
+    _t "Vault reachable from cluster with valid token — reports VAULT_OK" bash -c '
+      export UNIT_TEST_MODE=1
+      source '"$SCRIPT"'
+      VAULT_HOST="'"$INTEGRATION_VAULT_HOST"'"
+      VAULT_ACCOUNT_FILE="'"$INTEGRATION_VAULT_ACCOUNT"'"
+      check_vault
+    '
+
+    _t "Vault reports VAULT_AUTH_FAIL with invalid token" bash -c '
+      export UNIT_TEST_MODE=1
+      source '"$SCRIPT"'
+      tmpf=$(mktemp /tmp/vault-XXXX.key)
+      printf "VAULT_ADDR=http://'"$INTEGRATION_VAULT_HOST"':8200\nVAULT_TOKEN=invalid-token-xyz-99999\n" > "$tmpf"
+      VAULT_HOST="'"$INTEGRATION_VAULT_HOST"'"
+      VAULT_ACCOUNT_FILE="$tmpf"
+      result=0; check_vault >/dev/null 2>&1 || result=$?
+      rm -f "$tmpf"
+      [[ $result -ne 0 ]]
+    '
+
+    _t "Vault reports VAULT_UNREACHABLE with unreachable address" bash -c '
+      export UNIT_TEST_MODE=1
+      source '"$SCRIPT"'
+      tmpf=$(mktemp /tmp/vault-XXXX.key)
+      printf "VAULT_ADDR=http://192.0.2.1:8200\nVAULT_TOKEN=test-token\n" > "$tmpf"
+      VAULT_HOST="192.0.2.1"
+      VAULT_ACCOUNT_FILE="$tmpf"
+      result=0; check_vault >/dev/null 2>&1 || result=$?
+      rm -f "$tmpf"
+      [[ $result -ne 0 ]]
+    '
+  else
+    echo "  ⚠️  Vault tests skipped (pass --vault=HOST --vault-account=/path/to/vault-file.key)"
   fi
 fi
 

@@ -34,6 +34,10 @@ EXTERNAL_DB_PASSWORD="${EXTERNAL_DB_PASSWORD:-}"
 EXTERNAL_DB_PORT="${EXTERNAL_DB_PORT:-5432}"
 DB_CHECK_TIMEOUT="${DB_CHECK_TIMEOUT:-60}"
 
+VAULT_HOST="${VAULT_HOST:-}"
+VAULT_ACCOUNT_FILE="${VAULT_ACCOUNT_FILE:-}"
+VAULT_CHECK_TIMEOUT="${VAULT_CHECK_TIMEOUT:-60}"
+
 # Filled by cleanup() trap
 CLEANUP_NAMESPACE=""
 CLEANUP_PVC_NAME=""
@@ -205,9 +209,14 @@ parse_args() {
         EXTERNAL_DB_USER="$2"; shift 2;;
       --external-db-password)
         EXTERNAL_DB_PASSWORD="$2"; shift 2;;
+      --vault)
+        VAULT_HOST="$2"; shift 2;;
+      --vault-account)
+        VAULT_ACCOUNT_FILE="$2"; shift 2;;
       *)
         echo "Unknown option: $1" >&2
         echo "Usage: $0 [--external-db HOST] [--external-db-user USER] [--external-db-password PASS]" >&2
+        echo "       $0 [--vault HOST] [--vault-account FILE]" >&2
         exit 1;;
     esac
   done
@@ -907,6 +916,129 @@ PODSPEC
 export -f check_external_db
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CHECK K — HashiCorp Vault
+# ═══════════════════════════════════════════════════════════════════════════════
+check_vault() {
+  print_header "K. HashiCorp Vault"
+
+  if [[ -z "${VAULT_HOST:-}" ]]; then
+    print_info "Vault check skipped (--vault not provided)"
+    record_result "K. HashiCorp Vault" "⚠️ SKIP" "No Vault host specified — check skipped."
+    return 0
+  fi
+
+  if [[ -z "${VAULT_ACCOUNT_FILE:-}" ]]; then
+    print_fail "Vault account file not specified (--vault-account is required with --vault)"
+    record_result "K. HashiCorp Vault" "❌ FAIL" "No account file specified — use --vault-account."
+    return 1
+  fi
+
+  if [[ ! -f "${VAULT_ACCOUNT_FILE}" ]]; then
+    print_fail "Vault account file not found: ${VAULT_ACCOUNT_FILE}"
+    record_result "K. HashiCorp Vault" "❌ FAIL" "Account file not found: ${VAULT_ACCOUNT_FILE}"
+    return 1
+  fi
+
+  local vault_addr="" vault_token=""
+  while IFS='=' read -r key val; do
+    [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+    key="${key//[[:space:]]/}"; val="${val//[[:space:]]/}"
+    case "$key" in
+      VAULT_ADDR)  vault_addr="$val";;
+      VAULT_TOKEN) vault_token="$val";;
+    esac
+  done < "${VAULT_ACCOUNT_FILE}"
+
+  [[ -z "$vault_addr" ]] && vault_addr="http://${VAULT_HOST}:8200"
+
+  if [[ -z "$vault_token" ]]; then
+    print_fail "VAULT_TOKEN not found in ${VAULT_ACCOUNT_FILE}"
+    record_result "K. HashiCorp Vault" "❌ FAIL" "No VAULT_TOKEN entry in account file."
+    return 1
+  fi
+
+  local pod_name="kcs-precheck-vault-${RANDOM}"
+  local detail=""
+  detail+="**Vault address:** ${vault_addr}\n"
+  detail+="**Account file:** ${VAULT_ACCOUNT_FILE}\n"
+
+  print_info "Testing Vault connectivity to ${vault_addr} via cluster pod '${pod_name}'..."
+
+  kubectl apply -f - >/dev/null 2>&1 <<PODSPEC
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod_name}
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+  - name: check
+    image: curlimages/curl:latest
+    env:
+    - name: VAULT_TOKEN
+      value: "${vault_token}"
+    command:
+    - sh
+    - -c
+    - |
+      hcode=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 ${vault_addr}/v1/sys/health 2>/dev/null || echo 000)
+      if [ "\$hcode" = "000" ]; then echo VAULT_UNREACHABLE
+      elif [ "\$hcode" = "503" ] || [ "\$hcode" = "501" ]; then echo VAULT_SEALED
+      else
+        acode=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H "X-Vault-Token: \$VAULT_TOKEN" ${vault_addr}/v1/auth/token/lookup-self 2>/dev/null || echo 000)
+        if [ "\$acode" = "200" ]; then echo VAULT_OK; else echo VAULT_AUTH_FAIL; fi
+      fi
+PODSPEC
+
+  local timeout="${VAULT_CHECK_TIMEOUT:-60}"
+  local elapsed=0 phase=""
+  while [[ $elapsed -lt $timeout ]]; do
+    phase=$(kubectl get pod "$pod_name" -n default \
+      -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+    [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && break
+    sleep 2; elapsed=$(( elapsed + 2 ))
+  done
+
+  local result=""
+  [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && \
+    result=$(kubectl logs "$pod_name" -n default 2>/dev/null | tail -1 || echo "")
+
+  kubectl delete pod "$pod_name" -n default \
+    --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true
+
+  detail+="**Pod phase:** ${phase:-timeout}\n"
+
+  case "$result" in
+    VAULT_OK)
+      print_pass "Vault at ${vault_addr} is reachable and token is valid"
+      record_result "K. HashiCorp Vault" "✅ PASS" "$detail"
+      return 0;;
+    VAULT_UNREACHABLE)
+      print_fail "Cannot reach Vault at ${vault_addr} — host unreachable or port closed"
+      detail+="**Connection:** FAIL — network unreachable or port closed\n"
+      record_result "K. HashiCorp Vault" "❌ FAIL" "$detail"
+      return 1;;
+    VAULT_SEALED)
+      print_fail "Vault at ${vault_addr} is sealed — unseal Vault before installing KCS"
+      detail+="**Connection:** FAIL — Vault is sealed\n"
+      record_result "K. HashiCorp Vault" "❌ FAIL" "$detail"
+      return 1;;
+    VAULT_AUTH_FAIL)
+      print_fail "Vault at ${vault_addr} is reachable but token authentication failed"
+      detail+="**Connection:** FAIL — invalid or expired token\n"
+      record_result "K. HashiCorp Vault" "❌ FAIL" "$detail"
+      return 1;;
+    *)
+      print_warn "Vault check inconclusive — pod did not complete within ${timeout}s (phase: ${phase:-unknown})"
+      detail+="**Result:** ${result:-timeout}\n"
+      record_result "K. HashiCorp Vault" "⚠️ WARN" "$detail"
+      return 0;;
+  esac
+}
+export -f check_vault
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
 print_summary() {
@@ -991,6 +1123,7 @@ main() {
   check_os_kernel   || true
   check_ebpf        || true
   check_external_db || true
+  check_vault       || true
 
   print_summary
 

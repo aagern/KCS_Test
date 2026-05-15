@@ -92,9 +92,12 @@ if [[ $_SOURCED -eq 1 ]]; then
   _setup_mock_kubectl() {
     kubectl() {
       case "$*" in
-        # version
+        # version — returns JSON parsed by grep+sed (no python3 required)
+        *"version"*"--output=json"*)
+          echo '{"serverVersion":{"major":"1","minor":"31","gitVersion":"v1.31.2"}}';;
         *"version --output=json"*)
           echo '{"serverVersion":{"major":"1","minor":"31","gitVersion":"v1.31.2"}}';;
+
         # nodes arch
         *"nodeInfo.architecture"*)
           printf "amd64\namd64\namd64\namd64\n";;
@@ -170,7 +173,7 @@ if [[ $_SOURCED -eq 1 ]]; then
   # Old Kubernetes version
   kubectl() {
     case "$*" in
-      *"version --output=json"*)
+      *"version"*"--output=json"*)
         echo '{"serverVersion":{"major":"1","minor":"18","gitVersion":"v1.18.0"}}';;
       *"nodeInfo.architecture"*) printf "amd64\n";;
       *) echo "mock" ;;
@@ -208,6 +211,34 @@ fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""
+echo "━━━ Unit tests: no-python3 dependency ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+  _t "check_k8s_version works when python3 is absent from PATH" bash -c '
+    FAKEDIR=$(mktemp -d)
+    trap "rm -rf \"$FAKEDIR\"" EXIT
+    printf "#!/bin/sh\nexit 127\n" > "$FAKEDIR/python3"
+    chmod +x "$FAKEDIR/python3"
+    export PATH="$FAKEDIR:$PATH"
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"version"*"--output=json"*)
+          echo '"'"'{"serverVersion":{"major":"1","minor":"31"}}'"'"';;
+        *"nodeInfo.architecture"*) printf "amd64\n";;
+        *) return 1;;
+      esac
+    }
+    export -f kubectl
+    check_k8s_version
+  '
+else
+  echo "  ⚠️  Skipped (script not found)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
 echo "━━━ Integration tests: real cluster ($KUBECONFIG_ARG) ━━━━━━━━━━━━━━━━━"
 
 if [[ -z "$KUBECONFIG_ARG" ]]; then
@@ -225,8 +256,10 @@ else
     bash -c "kubectl --kubeconfig=${_KUBE_PATH} cluster-info"
 
   _t "Kubernetes version ≥ 1.21" bash -c "
-    minor=\$(kubectl --kubeconfig=${_KUBE_PATH} version --output=json \
-      | python3 -c \"import sys,json; v=json.load(sys.stdin)['serverVersion']; print(v['minor'].rstrip('+'))\")
+    ver_json=\$(kubectl --kubeconfig=${_KUBE_PATH} version --output=json 2>/dev/null)
+    minor=\$(printf '%s\n' \"\$ver_json\" | grep -A20 'serverVersion' | grep '\"minor\"' | head -1 \
+      | sed 's/.*\"minor\"[^\"]*\"\([^\"]*\)\".*/\1/' | tr -d '\"')
+    minor=\"\${minor//[^0-9]/}\"
     [[ \"\$minor\" -ge 21 ]]
   "
 

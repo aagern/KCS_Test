@@ -1,6 +1,6 @@
 # KCS 2.4 Kubernetes Pre-Installation Checker
 
-`kcs_k8s_check.sh` verifies that a Kubernetes cluster meets all prerequisites for installing **Kaspersky Container Security 2.4** before you run `helm install`. The script checks permissions by creating temporary resources: a test PVC and a registry-probe pod, both in namespace `default`, which are deleted automatically on exit.
+`kcs_k8s_check.sh` verifies that a Kubernetes cluster meets all prerequisites for installing **Kaspersky Container Security 2.4** before you run `helm install`. It is fully read-only — the only temporary resources it creates (a test PVC and a registry-probe pod, both in namespace `default`) are deleted automatically on exit.
 
 ## Requirements
 
@@ -8,8 +8,10 @@
 |---|---|
 | `bash` ≥ 4.0 | Script runtime |
 | `kubectl` | Cluster access |
-| `python3` | Parsing `kubectl version --output=json` |
-| `dig` or `nslookup` | DNS check (check F only) |
+| `grep`, `sed`, `awk` | JSON parsing (POSIX, present on all systems) |
+| `dig` or `nslookup` | DNS check (check F only, optional) |
+
+`python3` is **not required**. Version parsing uses `grep`+`sed` on `kubectl version --output=json` output.
 
 A valid kubeconfig must be reachable — either via `KUBECONFIG`, `--kubeconfig`, or the default `~/.kube/config`.
 
@@ -111,4 +113,4 @@ The report contains the measured value, threshold, status, and raw `kubectl` out
 bash kcs_k8s_check_test.sh --kubeconfig=/path/to/kubeconfig.yaml
 ```
 
-The test suite runs unit tests (normalization helpers, mock-kubectl pass/fail cases) and integration tests against a real cluster. All 35 tests must pass.
+The test suite runs unit tests (normalization helpers, mock-kubectl pass/fail cases, python3-absence check) and integration tests against a real cluster. All 36 tests must pass.

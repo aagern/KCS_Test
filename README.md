@@ -121,6 +121,8 @@ REGISTRY_TEST_IMAGE=alpine \
 | I | eBPF capabilities — BTF support | `/sys/kernel/btf/vmlinux` must exist on every node (`CONFIG_DEBUG_INFO_BTF=y`), required for eBPF CO-RE used by KCS agents |
 | J | External PostgreSQL database | Runs a `postgres:15-alpine` pod inside the cluster and performs `pg_isready` + `psql -c "SELECT 1"` against the supplied host — verifies both network path and authentication |
 | K | HashiCorp Vault | Runs a `curlimages/curl` pod inside the cluster and checks Vault health (HTTP status) then authenticates with the supplied token — verifies both network reachability and token validity |
+| L | Container runtime | Reads `nodeInfo.containerRuntimeVersion` for every node — `containerd` and `CRI-O` pass; `docker` fails |
+| M | CNI plugin | Detects Calico (any version), Flannel (any version), or Cilium; for Cilium, only versions 1.16, 1.17, and 1.18 are supported — any other Cilium version fails |
 
 Checks F and G are skipped when `DOMAIN` is empty or `SKIP_*` flags are set. Check J is skipped when `--external-db` is not provided. Check K is skipped when `--vault` is not provided.
 
@@ -212,6 +214,31 @@ An annotated example is provided in `vault-account-example.key`.
 - The server address must be reachable from within the cluster pod network (not only from the node itself).
 - The token must have at minimum the `lookup-self` capability (`auth/token/lookup-self` endpoint).
 
+### Notes on check L
+
+**Check L — Container runtime** reads `nodeInfo.containerRuntimeVersion` directly from the Kubernetes API for every node. No SSH or privileged access is required.
+
+| Runtime | Result |
+|---|---|
+| `containerd` | ✅ PASS |
+| `cri-o` | ✅ PASS |
+| `docker` | ❌ FAIL |
+| anything else | ⚠️ WARN |
+
+Docker (including Docker via `dockershim` or `cri-dockerd`) is not supported by KCS 2.4. If any node reports a Docker runtime the check fails and the cluster is considered not ready.
+
+### Notes on check M
+
+**Check M — CNI plugin** probes for known CNI DaemonSets using the Kubernetes API. No pods are created.
+
+Detection order:
+
+1. **Calico** — looks for DaemonSet `calico-node` in namespace `calico-system`. Any version is supported.
+2. **Flannel** — looks for DaemonSet `kube-flannel-ds` in namespace `kube-flannel`. Any version is supported.
+3. **Cilium** — looks for DaemonSet `cilium` in namespace `kube-system`. Only minor versions **1.16**, **1.17**, and **1.18** are supported; any other version causes a FAIL.
+
+If none of the above DaemonSets is found the check issues a WARN (not a FAIL) so that clusters with custom or unsupported CNIs do not block the pre-check entirely — manual verification is still required.
+
 ## Output
 
 **Console** — colour-coded pass/fail/warn per check, summary table at the end.
@@ -238,7 +265,7 @@ The report contains the measured value, threshold, status, and raw `kubectl` out
 bash kcs_k8s_check_test.sh --kubeconfig=/path/to/kubeconfig.yaml
 ```
 
-The test suite runs unit tests (normalization helpers, kernel version parsing, mock-kubectl pass/fail cases, python3-absence check, external-DB and Vault checks) and integration tests against a real cluster. All 63 unit tests must pass; integration tests require `--kubeconfig=` and optionally `--external-db=` / `--vault=`.
+The test suite runs unit tests (normalization helpers, kernel version parsing, mock-kubectl pass/fail cases, python3-absence check, external-DB, Vault, container runtime, and CNI checks) and integration tests against a real cluster. All 75 unit tests must pass; integration tests require `--kubeconfig=` and optionally `--external-db=` / `--vault=`.
 
 ```bash
 # Unit tests only

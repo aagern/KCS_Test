@@ -1039,6 +1039,122 @@ PODSPEC
 export -f check_vault
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CHECK L — Container runtime
+# ═══════════════════════════════════════════════════════════════════════════════
+check_container_runtime() {
+  print_header "L. Container runtime"
+
+  local fail=0 detail=""
+
+  local runtime_info
+  runtime_info=$(kubectl get nodes \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.nodeInfo.containerRuntimeVersion}{"\n"}{end}' \
+    2>/dev/null)
+
+  detail+="**Node container runtime info:**\n\`\`\`\n${runtime_info}\n\`\`\`\n"
+
+  while IFS=$'\t' read -r node_name runtime_ver; do
+    [[ -z "$node_name" ]] && continue
+    local runtime_name="${runtime_ver%%://*}"
+    case "$runtime_name" in
+      containerd|cri-o)
+        print_pass "Node ${node_name}: ${runtime_ver}"
+        detail+="**${node_name}:** PASS — ${runtime_ver}\n"
+        ;;
+      docker)
+        print_fail "Node ${node_name}: ${runtime_ver} — Docker runtime is not supported by KCS; use containerd or CRI-O"
+        detail+="**${node_name}:** FAIL — Docker runtime is not supported\n"
+        fail=1
+        ;;
+      *)
+        print_warn "Node ${node_name}: ${runtime_ver} — unknown runtime; containerd and CRI-O are verified supported"
+        detail+="**${node_name}:** WARN — unknown runtime ${runtime_name}\n"
+        ;;
+    esac
+  done <<< "$runtime_info"
+
+  if [[ $fail -eq 0 ]]; then
+    record_result "L. Container runtime" "✅ PASS" "$detail"
+    return 0
+  else
+    record_result "L. Container runtime" "❌ FAIL" "$detail"
+    return 1
+  fi
+}
+export -f check_container_runtime
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHECK M — CNI plugin
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Supported Cilium minor versions (space-separated major.minor pairs)
+CILIUM_SUPPORTED_VERSIONS="1.16 1.17 1.18"
+
+check_cni() {
+  print_header "M. CNI plugin"
+
+  local detail="" cni_name="" cni_image="" cni_version=""
+
+  # Try Calico
+  cni_image=$(kubectl get daemonset calico-node -n calico-system \
+    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+  if [[ -n "$cni_image" ]]; then
+    cni_name="Calico"
+    cni_version="${cni_image##*:}"
+    print_pass "CNI: ${cni_name} ${cni_version} (image: ${cni_image})"
+    detail+="**CNI:** ${cni_name} ${cni_version} — PASS\n"
+    record_result "M. CNI plugin" "✅ PASS" "$detail"
+    return 0
+  fi
+
+  # Try Flannel
+  cni_image=$(kubectl get daemonset kube-flannel-ds -n kube-flannel \
+    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+  if [[ -n "$cni_image" ]]; then
+    cni_name="Flannel"
+    cni_version="${cni_image##*:}"
+    print_pass "CNI: ${cni_name} ${cni_version} (image: ${cni_image})"
+    detail+="**CNI:** ${cni_name} ${cni_version} — PASS\n"
+    record_result "M. CNI plugin" "✅ PASS" "$detail"
+    return 0
+  fi
+
+  # Try Cilium
+  cni_image=$(kubectl get daemonset cilium -n kube-system \
+    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+  if [[ -n "$cni_image" ]]; then
+    cni_name="Cilium"
+    cni_version="${cni_image##*:}"
+    # strip leading 'v'
+    local ver="${cni_version#v}"
+    local major="${ver%%.*}"; local rest="${ver#*.}"; local minor="${rest%%.*}"
+    local major_minor="${major}.${minor}"
+    local supported=0
+    for mv in $CILIUM_SUPPORTED_VERSIONS; do
+      [[ "$mv" == "$major_minor" ]] && supported=1
+    done
+    if [[ $supported -eq 1 ]]; then
+      print_pass "CNI: ${cni_name} ${cni_version} (image: ${cni_image})"
+      detail+="**CNI:** ${cni_name} ${cni_version} — PASS (supported version)\n"
+      record_result "M. CNI plugin" "✅ PASS" "$detail"
+      return 0
+    else
+      print_fail "CNI: ${cni_name} ${cni_version} — only versions 1.16, 1.17, and 1.18 are supported by KCS 2.4"
+      detail+="**CNI:** ${cni_name} ${cni_version} — FAIL (unsupported version; supported: 1.16, 1.17, 1.18)\n"
+      record_result "M. CNI plugin" "❌ FAIL" "$detail"
+      return 1
+    fi
+  fi
+
+  # No known CNI found
+  print_warn "CNI: no known CNI detected (checked Calico, Flannel, Cilium) — verify CNI compatibility manually"
+  detail+="**CNI:** unknown — WARN (no Calico/Flannel/Cilium daemonset found)\n"
+  record_result "M. CNI plugin" "⚠️ WARN" "$detail"
+  return 0
+}
+export -f check_cni
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
 print_summary() {
@@ -1122,8 +1238,10 @@ main() {
   [[ -z "$SKIP_REGISTRY_CHECK" ]] && { check_registry || true; }
   check_os_kernel   || true
   check_ebpf        || true
-  check_external_db || true
-  check_vault       || true
+  check_external_db        || true
+  check_vault              || true
+  check_container_runtime  || true
+  check_cni                || true
 
   print_summary
 

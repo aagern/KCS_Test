@@ -11,6 +11,10 @@ readonly MIN_EPHEMERAL_MIB=28672     # 28 GiB
 readonly PVC_BIND_TIMEOUT=30
 readonly POD_POLL_TIMEOUT=60
 readonly POD_PENDING_WARN_SEC=20
+readonly MIN_KERNEL_MAJOR=4          # kernel >= 4.18 required
+readonly MIN_KERNEL_MINOR=18
+readonly WARN_KERNEL_MAJOR=5         # kernel < 5.8 needs kcs-ih privileged mode
+readonly WARN_KERNEL_MINOR=8
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 REPORT_FILE="kcs-precheck-${TIMESTAMP}.md"
@@ -130,6 +134,29 @@ normalize_ephemeral_mib() {
   fi
 }
 export -f normalize_ephemeral_mib
+
+# parse_kernel_version "5.15.0-91-generic" → prints "5 15" (major minor)
+parse_kernel_version() {
+  local ver="$1"
+  local major minor
+  major=$(echo "$ver" | sed 's/^\([0-9]*\).*/\1/')
+  minor=$(echo "$ver" | sed 's/^[0-9]*\.\([0-9]*\).*/\1/')
+  echo "$major $minor"
+}
+export -f parse_kernel_version
+
+# kernel_ge "5.15.0-91-generic" 4 18 → returns 0 if kernel >= major.minor
+kernel_ge() {
+  local ver="$1" req_major="$2" req_minor="$3"
+  local kv k_major k_minor
+  kv=$(parse_kernel_version "$ver")
+  k_major="${kv% *}"
+  k_minor="${kv#* }"
+  if [[ "$k_major" -gt "$req_major" ]]; then return 0
+  elif [[ "$k_major" -eq "$req_major" ]] && [[ "$k_minor" -ge "$req_minor" ]]; then return 0
+  else return 1; fi
+}
+export -f kernel_ge
 
 # ── preflight ────────────────────────────────────────────────────────────────
 preflight_check() {
@@ -648,6 +675,132 @@ check_registry() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CHECK H — OS distribution and kernel version
+# ═══════════════════════════════════════════════════════════════════════════════
+check_os_kernel() {
+  print_header "H. OS distribution and kernel version"
+
+  local fail=0 detail=""
+
+  local node_info
+  node_info=$(kubectl get nodes \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.nodeInfo.osImage}{"\t"}{.status.nodeInfo.kernelVersion}{"\n"}{end}' \
+    2>/dev/null)
+
+  detail+="**Node OS and kernel info:**\n\`\`\`\n${node_info}\n\`\`\`\n"
+
+  local has_warn=0
+  while IFS=$'\t' read -r node_name os_image kernel_ver; do
+    [[ -z "$node_name" ]] && continue
+
+    if ! kernel_ge "$kernel_ver" "$MIN_KERNEL_MAJOR" "$MIN_KERNEL_MINOR"; then
+      print_fail "Node ${node_name}: kernel ${kernel_ver} (${os_image}) — minimum ${MIN_KERNEL_MAJOR}.${MIN_KERNEL_MINOR} required"
+      detail+="**${node_name}:** FAIL — kernel ${kernel_ver} < ${MIN_KERNEL_MAJOR}.${MIN_KERNEL_MINOR}\n"
+      fail=1
+    elif ! kernel_ge "$kernel_ver" "$WARN_KERNEL_MAJOR" "$WARN_KERNEL_MINOR"; then
+      print_warn "Node ${node_name}: kernel ${kernel_ver} (${os_image}) — kernel < ${WARN_KERNEL_MAJOR}.${WARN_KERNEL_MINOR}, kcs-ih must run in privileged mode"
+      detail+="**${node_name}:** WARN — kernel ${kernel_ver} ≥ ${MIN_KERNEL_MAJOR}.${MIN_KERNEL_MINOR} but < ${WARN_KERNEL_MAJOR}.${WARN_KERNEL_MINOR}, privileged mode required for kcs-ih\n"
+      has_warn=1
+    else
+      print_pass "Node ${node_name}: kernel ${kernel_ver} (${os_image})"
+      detail+="**${node_name}:** PASS — kernel ${kernel_ver} ≥ ${WARN_KERNEL_MAJOR}.${WARN_KERNEL_MINOR}\n"
+    fi
+  done <<< "$node_info"
+
+  if [[ $fail -eq 0 ]] && [[ $has_warn -eq 1 ]]; then
+    record_result "H. OS and kernel version" "⚠️ WARN" "$detail"
+    return 0
+  elif [[ $fail -eq 0 ]]; then
+    record_result "H. OS and kernel version" "✅ PASS" "$detail"
+    return 0
+  else
+    record_result "H. OS and kernel version" "❌ FAIL" "$detail"
+    return 1
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHECK I — eBPF capabilities (BTF support)
+# ═══════════════════════════════════════════════════════════════════════════════
+check_ebpf() {
+  print_header "I. eBPF capabilities (BTF support)"
+
+  local fail=0 detail=""
+  detail+="**Checking /sys/kernel/btf/vmlinux on each node (requires privileged pod)...**\n"
+
+  local node_names
+  node_names=$(kubectl get nodes --no-headers \
+    -o custom-columns=NAME:.metadata.name 2>/dev/null)
+
+  while IFS= read -r node_name; do
+    [[ -z "$node_name" ]] && continue
+
+    local pod_name="kcs-ebpf-${RANDOM}"
+    kubectl apply -f - >/dev/null 2>&1 <<PODSPEC
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod_name}
+  namespace: default
+spec:
+  nodeName: ${node_name}
+  restartPolicy: Never
+  tolerations:
+  - operator: Exists
+  containers:
+  - name: check
+    image: busybox:1.36
+    command: [sh, -c, test -f /sys/kernel/btf/vmlinux && echo BTF_OK || echo BTF_MISSING]
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: sys
+      mountPath: /sys
+      readOnly: true
+  volumes:
+  - name: sys
+    hostPath:
+      path: /sys
+PODSPEC
+
+    local elapsed=0 phase=""
+    while [[ $elapsed -lt 90 ]]; do
+      phase=$(kubectl get pod "$pod_name" -n default \
+        -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+      [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && break
+      sleep 2; elapsed=$(( elapsed + 2 ))
+    done
+
+    local btf_result=""
+    [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && \
+      btf_result=$(kubectl logs "$pod_name" -n default 2>/dev/null || echo "")
+
+    kubectl delete pod "$pod_name" -n default \
+      --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true
+
+    if [[ "$btf_result" == "BTF_OK" ]]; then
+      print_pass "Node ${node_name}: BTF available (/sys/kernel/btf/vmlinux found)"
+      detail+="**${node_name}:** PASS — CONFIG_DEBUG_INFO_BTF=y, eBPF CO-RE supported\n"
+    elif [[ "$btf_result" == "BTF_MISSING" ]]; then
+      print_fail "Node ${node_name}: BTF NOT available (/sys/kernel/btf/vmlinux missing) — CONFIG_DEBUG_INFO_BTF=y required for eBPF CO-RE"
+      detail+="**${node_name}:** FAIL — BTF missing, eBPF CO-RE not supported\n"
+      fail=1
+    else
+      print_warn "Node ${node_name}: eBPF check inconclusive (pod phase: ${phase:-unknown})"
+      detail+="**${node_name}:** WARN — check pod did not complete (phase: ${phase:-unknown})\n"
+    fi
+  done <<< "$node_names"
+
+  if [[ $fail -eq 0 ]]; then
+    record_result "I. eBPF capabilities" "✅ PASS" "$detail"
+    return 0
+  else
+    record_result "I. eBPF capabilities" "❌ FAIL" "$detail"
+    return 1
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
 print_summary() {
@@ -727,6 +880,8 @@ main() {
   check_ingress     || true
   check_dns         || true
   [[ -z "$SKIP_REGISTRY_CHECK" ]] && { check_registry || true; }
+  check_os_kernel   || true
+  check_ebpf        || true
 
   print_summary
 

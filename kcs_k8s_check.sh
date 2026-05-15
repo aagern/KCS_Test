@@ -862,7 +862,7 @@ spec:
     env:
     - name: PGPASSWORD
       value: "${pass}"
-    command: ["sh", "-c", "pg_isready -h ${host} -p ${port} -U ${user} -t 10 2>/dev/null && psql -h ${host} -p ${port} -U ${user} -c 'SELECT 1' postgres >/dev/null 2>&1 && echo DB_CONNECT_OK || echo DB_CONNECT_FAIL"]
+    command: ["sh", "-c", "if pg_isready -h ${host} -p ${port} -U ${user} -t 10 2>/dev/null; then if psql -h ${host} -p ${port} -U ${user} -c 'SELECT 1' postgres >/dev/null 2>&1; then echo DB_CONNECT_OK; else echo DB_CONNECT_FAIL_AUTH; fi; else echo DB_CONNECT_FAIL_NETWORK; fi"]
 PODSPEC
 
   local timeout="${DB_CHECK_TIMEOUT:-60}"
@@ -887,9 +887,14 @@ PODSPEC
     print_pass "PostgreSQL at ${host}:${port} reachable, user '${user}' authenticated"
     record_result "J. External PostgreSQL" "✅ PASS" "$detail"
     return 0
-  elif [[ "$result" == "DB_CONNECT_FAIL" ]]; then
-    print_fail "Cannot connect to PostgreSQL at ${host}:${port} as user '${user}' — host unreachable or authentication failed"
-    detail+="**Connection:** FAIL\n"
+  elif [[ "$result" == "DB_CONNECT_FAIL_NETWORK" ]]; then
+    print_fail "Cannot reach PostgreSQL at ${host}:${port} — host unreachable or port closed"
+    detail+="**Connection:** FAIL — network unreachable or port closed\n"
+    record_result "J. External PostgreSQL" "❌ FAIL" "$detail"
+    return 1
+  elif [[ "$result" == "DB_CONNECT_FAIL_AUTH" ]]; then
+    print_fail "PostgreSQL at ${host}:${port} is reachable but authentication failed for user '${user}'"
+    detail+="**Connection:** FAIL — authentication failed (wrong user or password)\n"
     record_result "J. External PostgreSQL" "❌ FAIL" "$detail"
     return 1
   else

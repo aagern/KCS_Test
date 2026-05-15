@@ -426,18 +426,18 @@ if [[ $_SOURCED -eq 1 ]]; then
   _t "check_external_db PASSES when pod reports DB_CONNECT_OK" \
     check_external_db
 
-  # check_external_db FAIL case — mock pod reports authentication failure
+  # check_external_db FAIL case — mock pod reports network failure
   kubectl() {
     case "$*" in
       *"apply -f"*)                          echo "pod/kcs-precheck-db created";;
       *"get pod"*"kcs-precheck-db"*)         echo "Succeeded";;
-      *"logs"*"kcs-precheck-db"*)            echo "DB_CONNECT_FAIL";;
+      *"logs"*"kcs-precheck-db"*)            echo "DB_CONNECT_FAIL_NETWORK";;
       *"delete pod"*)                        echo "pod deleted";;
       *)                                     echo "mock";;
     esac
   }
   export -f kubectl
-  _t "check_external_db FAILS when pod reports DB_CONNECT_FAIL" \
+  _t "check_external_db FAILS when pod reports DB_CONNECT_FAIL_NETWORK" \
     _assert_check_fails check_external_db
 
   # check_external_db WARN case — pod never completes (DB_CHECK_TIMEOUT=0 skips loop)
@@ -452,6 +452,44 @@ if [[ $_SOURCED -eq 1 ]]; then
   export -f kubectl
   _t "check_external_db WARNS (not fails) when pod times out" \
     check_external_db
+
+  # RED: network failure produces a distinct "unreachable" message and returns non-zero
+  _t "check_external_db FAILS with unreachable message when pod reports DB_CONNECT_FAIL_NETWORK" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    EXTERNAL_DB_HOST="10.0.0.1"; EXTERNAL_DB_USER="kcs_user"; EXTERNAL_DB_PASSWORD="s3cr3t"
+    kubectl() {
+      case "$*" in
+        *"apply -f"*)                  echo "pod created";;
+        *"get pod"*"kcs-precheck-db"*) echo "Succeeded";;
+        *"logs"*"kcs-precheck-db"*)    echo "DB_CONNECT_FAIL_NETWORK";;
+        *"delete pod"*)                echo "pod deleted";;
+        *)                             echo "mock";;
+      esac
+    }
+    export -f kubectl
+    output=$(check_external_db 2>&1); rc=$?
+    [[ $rc -ne 0 ]] && echo "$output" | grep -qi "unreachable\|network\|port"
+  '
+
+  # RED: auth failure produces a distinct "authentication" message and returns non-zero
+  _t "check_external_db FAILS with authentication message when pod reports DB_CONNECT_FAIL_AUTH" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    EXTERNAL_DB_HOST="10.0.0.1"; EXTERNAL_DB_USER="kcs_user"; EXTERNAL_DB_PASSWORD="wrongpass"
+    kubectl() {
+      case "$*" in
+        *"apply -f"*)                  echo "pod created";;
+        *"get pod"*"kcs-precheck-db"*) echo "Succeeded";;
+        *"logs"*"kcs-precheck-db"*)    echo "DB_CONNECT_FAIL_AUTH";;
+        *"delete pod"*)                echo "pod deleted";;
+        *)                             echo "mock";;
+      esac
+    }
+    export -f kubectl
+    output=$(check_external_db 2>&1); rc=$?
+    [[ $rc -ne 0 ]] && echo "$output" | grep -qi "auth\|password\|credential"
+  '
 
   # Reset state
   EXTERNAL_DB_HOST=""
@@ -591,10 +629,9 @@ else
   "
 
   if [[ -n "$INTEGRATION_EXTERNAL_DB" ]]; then
-    _t "external PostgreSQL reachable from cluster (pg_isready + psql SELECT 1)" bash -c "
-      podname=\"kcs-db-inttest-\$RANDOM\"
-      trap 'kubectl --kubeconfig=${_KUBE_PATH} delete pod \"\$podname\" \
-        -n default --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true' EXIT
+    _t "external PostgreSQL reachable from cluster — reports DB_CONNECT_OK" bash -c "
+      podname=\"kcs-db-ok-\$RANDOM\"
+      trap 'kubectl --kubeconfig=${_KUBE_PATH} delete pod \"\$podname\" -n default --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true' EXIT
       kubectl --kubeconfig=${_KUBE_PATH} apply -f - >/dev/null 2>&1 <<PODSPEC
 apiVersion: v1
 kind: Pod
@@ -609,20 +646,74 @@ spec:
     env:
     - name: PGPASSWORD
       value: \"${INTEGRATION_EXTERNAL_DB_PASSWORD}\"
-    command: [\"sh\", \"-c\", \"pg_isready -h ${INTEGRATION_EXTERNAL_DB} -p 5432 -U ${INTEGRATION_EXTERNAL_DB_USER} -t 10 2>/dev/null && psql -h ${INTEGRATION_EXTERNAL_DB} -p 5432 -U ${INTEGRATION_EXTERNAL_DB_USER} -c 'SELECT 1' postgres >/dev/null 2>&1 && echo DB_CONNECT_OK || echo DB_CONNECT_FAIL\"]
+    command: [\"sh\", \"-c\", \"if pg_isready -h ${INTEGRATION_EXTERNAL_DB} -p 5432 -U ${INTEGRATION_EXTERNAL_DB_USER} -t 10 2>/dev/null; then if psql -h ${INTEGRATION_EXTERNAL_DB} -p 5432 -U ${INTEGRATION_EXTERNAL_DB_USER} -c 'SELECT 1' postgres >/dev/null 2>&1; then echo DB_CONNECT_OK; else echo DB_CONNECT_FAIL_AUTH; fi; else echo DB_CONNECT_FAIL_NETWORK; fi\"]
 PODSPEC
       elapsed=0; phase=\"\"
       while [[ \$elapsed -lt 90 ]]; do
-        phase=\$(kubectl --kubeconfig=${_KUBE_PATH} get pod \"\$podname\" -n default \
-          -o jsonpath='{.status.phase}' 2>/dev/null || echo \"\")
+        phase=\$(kubectl --kubeconfig=${_KUBE_PATH} get pod \"\$podname\" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo \"\")
         [[ \"\$phase\" == Succeeded || \"\$phase\" == Failed ]] && break
         sleep 3; elapsed=\$((elapsed+3))
       done
       result=\$(kubectl --kubeconfig=${_KUBE_PATH} logs \"\$podname\" -n default 2>/dev/null | tail -1 || echo \"\")
       [[ \"\$result\" == DB_CONNECT_OK ]]
     "
+
+    _t "pod command reports DB_CONNECT_FAIL_AUTH on wrong password" bash -c "
+      podname=\"kcs-db-auth-\$RANDOM\"
+      trap 'kubectl --kubeconfig=${_KUBE_PATH} delete pod \"\$podname\" -n default --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true' EXIT
+      kubectl --kubeconfig=${_KUBE_PATH} apply -f - >/dev/null 2>&1 <<PODSPEC
+apiVersion: v1
+kind: Pod
+metadata:
+  name: \${podname}
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+  - name: check
+    image: postgres:15-alpine
+    env:
+    - name: PGPASSWORD
+      value: \"wrongpassword_xyz\"
+    command: [\"sh\", \"-c\", \"if pg_isready -h ${INTEGRATION_EXTERNAL_DB} -p 5432 -U ${INTEGRATION_EXTERNAL_DB_USER} -t 10 2>/dev/null; then if psql -h ${INTEGRATION_EXTERNAL_DB} -p 5432 -U ${INTEGRATION_EXTERNAL_DB_USER} -c 'SELECT 1' postgres >/dev/null 2>&1; then echo DB_CONNECT_OK; else echo DB_CONNECT_FAIL_AUTH; fi; else echo DB_CONNECT_FAIL_NETWORK; fi\"]
+PODSPEC
+      elapsed=0; phase=\"\"
+      while [[ \$elapsed -lt 90 ]]; do
+        phase=\$(kubectl --kubeconfig=${_KUBE_PATH} get pod \"\$podname\" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo \"\")
+        [[ \"\$phase\" == Succeeded || \"\$phase\" == Failed ]] && break
+        sleep 3; elapsed=\$((elapsed+3))
+      done
+      result=\$(kubectl --kubeconfig=${_KUBE_PATH} logs \"\$podname\" -n default 2>/dev/null | tail -1 || echo \"\")
+      [[ \"\$result\" == DB_CONNECT_FAIL_AUTH ]]
+    "
+
+    _t "pod command reports DB_CONNECT_FAIL_NETWORK on unreachable host" bash -c "
+      podname=\"kcs-db-net-\$RANDOM\"
+      trap 'kubectl --kubeconfig=${_KUBE_PATH} delete pod \"\$podname\" -n default --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true' EXIT
+      kubectl --kubeconfig=${_KUBE_PATH} apply -f - >/dev/null 2>&1 <<PODSPEC
+apiVersion: v1
+kind: Pod
+metadata:
+  name: \${podname}
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+  - name: check
+    image: postgres:15-alpine
+    command: [\"sh\", \"-c\", \"if pg_isready -h 127.0.0.1 -p 5432 -U nobody -t 5 2>/dev/null; then echo DB_CONNECT_OK; else echo DB_CONNECT_FAIL_NETWORK; fi\"]
+PODSPEC
+      elapsed=0; phase=\"\"
+      while [[ \$elapsed -lt 90 ]]; do
+        phase=\$(kubectl --kubeconfig=${_KUBE_PATH} get pod \"\$podname\" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo \"\")
+        [[ \"\$phase\" == Succeeded || \"\$phase\" == Failed ]] && break
+        sleep 3; elapsed=\$((elapsed+3))
+      done
+      result=\$(kubectl --kubeconfig=${_KUBE_PATH} logs \"\$podname\" -n default 2>/dev/null | tail -1 || echo \"\")
+      [[ \"\$result\" == DB_CONNECT_FAIL_NETWORK ]]
+    "
   else
-    echo "  ⚠️  External PostgreSQL test skipped (pass --external-db=HOST --external-db-user=USER --external-db-password=PASS)"
+    echo "  ⚠️  External PostgreSQL tests skipped (pass --external-db=HOST --external-db-user=USER --external-db-password=PASS)"
   fi
 fi
 

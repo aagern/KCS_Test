@@ -951,97 +951,37 @@ PODSPEC
   fi
 
   if [[ -n "$INTEGRATION_VAULT_HOST" && -n "$INTEGRATION_VAULT_ACCOUNT" ]]; then
-    _t "Vault reachable from cluster with valid token — reports VAULT_OK" bash -c "
-      podname=\"kcs-vault-ok-\$RANDOM\"
-      trap 'kubectl --kubeconfig=${_KUBE_PATH} delete pod \"\$podname\" -n default --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true' EXIT
-      vault_token=\$(grep '^VAULT_TOKEN=' \"${INTEGRATION_VAULT_ACCOUNT}\" | cut -d= -f2-)
-      vault_addr=\$(grep '^VAULT_ADDR=' \"${INTEGRATION_VAULT_ACCOUNT}\" | cut -d= -f2-)
-      [[ -z \"\$vault_addr\" ]] && vault_addr=\"http://${INTEGRATION_VAULT_HOST}:8200\"
-      kubectl --kubeconfig=${_KUBE_PATH} apply -f - >/dev/null 2>&1 <<PODSPEC
-apiVersion: v1
-kind: Pod
-metadata:
-  name: \${podname}
-  namespace: default
-spec:
-  restartPolicy: Never
-  containers:
-  - name: check
-    image: curlimages/curl:latest
-    env:
-    - name: VAULT_TOKEN
-      value: \"\${vault_token}\"
-    command: [\"sh\", \"-c\", \"health=\$(curl -s --max-time 5 \${vault_addr}/v1/sys/health 2>/dev/null||echo ''); if [ -z \\\"\\\$health\\\" ]; then echo VAULT_UNREACHABLE; elif echo \\\"\\\$health\\\" | grep -q '\\\"sealed\\\":true'; then echo VAULT_SEALED; else code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H \\\"X-Vault-Token: \\\$VAULT_TOKEN\\\" \${vault_addr}/v1/auth/token/lookup-self 2>/dev/null||echo 000); if [ \\\"\\\$code\\\" = '200' ]; then echo VAULT_OK; else echo VAULT_AUTH_FAIL; fi; fi\"]
-PODSPEC
-      elapsed=0; phase=\"\"
-      while [[ \$elapsed -lt 90 ]]; do
-        phase=\$(kubectl --kubeconfig=${_KUBE_PATH} get pod \"\$podname\" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo \"\")
-        [[ \"\$phase\" == Succeeded || \"\$phase\" == Failed ]] && break
-        sleep 3; elapsed=\$((elapsed+3))
-      done
-      result=\$(kubectl --kubeconfig=${_KUBE_PATH} logs \"\$podname\" -n default 2>/dev/null | tail -1 || echo \"\")
-      [[ \"\$result\" == VAULT_OK ]]
-    "
+    _t "Vault reachable from cluster with valid token — reports VAULT_OK" bash -c '
+      export UNIT_TEST_MODE=1
+      source '"$SCRIPT"'
+      VAULT_HOST="'"$INTEGRATION_VAULT_HOST"'"
+      VAULT_ACCOUNT_FILE="'"$INTEGRATION_VAULT_ACCOUNT"'"
+      check_vault
+    '
 
-    _t "pod command reports VAULT_AUTH_FAIL on invalid token" bash -c "
-      podname=\"kcs-vault-auth-\$RANDOM\"
-      trap 'kubectl --kubeconfig=${_KUBE_PATH} delete pod \"\$podname\" -n default --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true' EXIT
-      vault_addr=\$(grep '^VAULT_ADDR=' \"${INTEGRATION_VAULT_ACCOUNT}\" | cut -d= -f2-)
-      [[ -z \"\$vault_addr\" ]] && vault_addr=\"http://${INTEGRATION_VAULT_HOST}:8200\"
-      kubectl --kubeconfig=${_KUBE_PATH} apply -f - >/dev/null 2>&1 <<PODSPEC
-apiVersion: v1
-kind: Pod
-metadata:
-  name: \${podname}
-  namespace: default
-spec:
-  restartPolicy: Never
-  containers:
-  - name: check
-    image: curlimages/curl:latest
-    env:
-    - name: VAULT_TOKEN
-      value: \"invalid-token-xyz-12345\"
-    command: [\"sh\", \"-c\", \"health=\$(curl -s --max-time 5 \${vault_addr}/v1/sys/health 2>/dev/null||echo ''); if [ -z \\\"\\\$health\\\" ]; then echo VAULT_UNREACHABLE; elif echo \\\"\\\$health\\\" | grep -q '\\\"sealed\\\":true'; then echo VAULT_SEALED; else code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H \\\"X-Vault-Token: \\\$VAULT_TOKEN\\\" \${vault_addr}/v1/auth/token/lookup-self 2>/dev/null||echo 000); if [ \\\"\\\$code\\\" = '200' ]; then echo VAULT_OK; else echo VAULT_AUTH_FAIL; fi; fi\"]
-PODSPEC
-      elapsed=0; phase=\"\"
-      while [[ \$elapsed -lt 90 ]]; do
-        phase=\$(kubectl --kubeconfig=${_KUBE_PATH} get pod \"\$podname\" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo \"\")
-        [[ \"\$phase\" == Succeeded || \"\$phase\" == Failed ]] && break
-        sleep 3; elapsed=\$((elapsed+3))
-      done
-      result=\$(kubectl --kubeconfig=${_KUBE_PATH} logs \"\$podname\" -n default 2>/dev/null | tail -1 || echo \"\")
-      [[ \"\$result\" == VAULT_AUTH_FAIL ]]
-    "
+    _t "Vault reports VAULT_AUTH_FAIL with invalid token" bash -c '
+      export UNIT_TEST_MODE=1
+      source '"$SCRIPT"'
+      tmpf=$(mktemp /tmp/vault-XXXX.key)
+      printf "VAULT_ADDR=http://'"$INTEGRATION_VAULT_HOST"':8200\nVAULT_TOKEN=invalid-token-xyz-99999\n" > "$tmpf"
+      VAULT_HOST="'"$INTEGRATION_VAULT_HOST"'"
+      VAULT_ACCOUNT_FILE="$tmpf"
+      result=0; check_vault >/dev/null 2>&1 || result=$?
+      rm -f "$tmpf"
+      [[ $result -ne 0 ]]
+    '
 
-    _t "pod command reports VAULT_UNREACHABLE on bad Vault address" bash -c "
-      podname=\"kcs-vault-net-\$RANDOM\"
-      trap 'kubectl --kubeconfig=${_KUBE_PATH} delete pod \"\$podname\" -n default --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true' EXIT
-      kubectl --kubeconfig=${_KUBE_PATH} apply -f - >/dev/null 2>&1 <<PODSPEC
-apiVersion: v1
-kind: Pod
-metadata:
-  name: \${podname}
-  namespace: default
-spec:
-  restartPolicy: Never
-  containers:
-  - name: check
-    image: curlimages/curl:latest
-    env:
-    - name: VAULT_TOKEN
-      value: \"test-token\"
-    command: [\"sh\", \"-c\", \"health=\$(curl -s --max-time 5 http://192.0.2.1:8200/v1/sys/health 2>/dev/null||echo ''); if [ -z \\\"\\\$health\\\" ]; then echo VAULT_UNREACHABLE; elif echo \\\"\\\$health\\\" | grep -q '\\\"sealed\\\":true'; then echo VAULT_SEALED; else code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H \\\"X-Vault-Token: \\\$VAULT_TOKEN\\\" http://192.0.2.1:8200/v1/auth/token/lookup-self 2>/dev/null||echo 000); if [ \\\"\\\$code\\\" = '200' ]; then echo VAULT_OK; else echo VAULT_AUTH_FAIL; fi; fi\"]
-PODSPEC
-      elapsed=0; phase=\"\"
-      while [[ \$elapsed -lt 90 ]]; do
-        phase=\$(kubectl --kubeconfig=${_KUBE_PATH} get pod \"\$podname\" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo \"\")
-        [[ \"\$phase\" == Succeeded || \"\$phase\" == Failed ]] && break
-        sleep 3; elapsed=\$((elapsed+3))
-      done
-      result=\$(kubectl --kubeconfig=${_KUBE_PATH} logs \"\$podname\" -n default 2>/dev/null | tail -1 || echo \"\")
-      [[ \"\$result\" == VAULT_UNREACHABLE ]]
-    "
+    _t "Vault reports VAULT_UNREACHABLE with unreachable address" bash -c '
+      export UNIT_TEST_MODE=1
+      source '"$SCRIPT"'
+      tmpf=$(mktemp /tmp/vault-XXXX.key)
+      printf "VAULT_ADDR=http://192.0.2.1:8200\nVAULT_TOKEN=test-token\n" > "$tmpf"
+      VAULT_HOST="192.0.2.1"
+      VAULT_ACCOUNT_FILE="$tmpf"
+      result=0; check_vault >/dev/null 2>&1 || result=$?
+      rm -f "$tmpf"
+      [[ $result -ne 0 ]]
+    '
   else
     echo "  ⚠️  Vault tests skipped (pass --vault=HOST --vault-account=/path/to/vault-file.key)"
   fi

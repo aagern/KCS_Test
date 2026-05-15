@@ -964,9 +964,6 @@ check_vault() {
 
   print_info "Testing Vault connectivity to ${vault_addr} via cluster pod '${pod_name}'..."
 
-  # Pod shell command: health check → sealed check → token auth → result token
-  local pod_cmd="health=\$(curl -s --max-time 5 ${vault_addr}/v1/sys/health 2>/dev/null||echo ''); if [ -z \"\$health\" ]; then echo VAULT_UNREACHABLE; elif echo \"\$health\"|grep -q '\"sealed\":true'; then echo VAULT_SEALED; else code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H \"X-Vault-Token: \$VAULT_TOKEN\" ${vault_addr}/v1/auth/token/lookup-self 2>/dev/null||echo 000); if [ \"\$code\" = '200' ]; then echo VAULT_OK; else echo VAULT_AUTH_FAIL; fi; fi"
-
   kubectl apply -f - >/dev/null 2>&1 <<PODSPEC
 apiVersion: v1
 kind: Pod
@@ -981,7 +978,17 @@ spec:
     env:
     - name: VAULT_TOKEN
       value: "${vault_token}"
-    command: ["sh", "-c", "${pod_cmd}"]
+    command:
+    - sh
+    - -c
+    - |
+      hcode=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 ${vault_addr}/v1/sys/health 2>/dev/null || echo 000)
+      if [ "\$hcode" = "000" ]; then echo VAULT_UNREACHABLE
+      elif [ "\$hcode" = "503" ] || [ "\$hcode" = "501" ]; then echo VAULT_SEALED
+      else
+        acode=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H "X-Vault-Token: \$VAULT_TOKEN" ${vault_addr}/v1/auth/token/lookup-self 2>/dev/null || echo 000)
+        if [ "\$acode" = "200" ]; then echo VAULT_OK; else echo VAULT_AUTH_FAIL; fi
+      fi
 PODSPEC
 
   local timeout="${VAULT_CHECK_TIMEOUT:-60}"

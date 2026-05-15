@@ -11,8 +11,6 @@
 | `grep`, `sed`, `awk` | JSON parsing (POSIX, present on all systems) |
 | `dig` or `nslookup` | DNS check (check F only, optional) |
 
-`python3` is **not required**. Version parsing uses `grep`+`sed` on `kubectl version --output=json` output.
-
 A valid kubeconfig must be reachable — either via `KUBECONFIG`, `--kubeconfig`, or the default `~/.kube/config`.
 
 ## Quick start

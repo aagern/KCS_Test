@@ -731,6 +731,196 @@ if [[ $_SOURCED -eq 1 ]]; then
   '
 
   _setup_mock_kubectl
+
+  # ─── Unit tests: check_container_runtime ──────────────────────────────────
+  echo ""
+  echo "━━━ Unit tests: check_container_runtime ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  _t "check_container_runtime passes when all nodes use containerd" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"containerRuntimeVersion"*)
+          printf "node1\tcontainerd://1.7.11\nnode2\tcontainerd://1.6.26\n";;
+        *) echo "mock" >&2; return 1;;
+      esac
+    }
+    export -f kubectl
+    check_container_runtime
+  '
+
+  _t "check_container_runtime passes when all nodes use cri-o" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"containerRuntimeVersion"*)
+          printf "node1\tcri-o://1.28.2\nnode2\tcri-o://1.27.1\n";;
+        *) echo "mock" >&2; return 1;;
+      esac
+    }
+    export -f kubectl
+    check_container_runtime
+  '
+
+  _t "check_container_runtime FAILS when any node uses docker" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"containerRuntimeVersion"*)
+          printf "node1\tdocker://24.0.5\nnode2\tcontainerd://1.7.11\n";;
+        *) echo "mock" >&2; return 1;;
+      esac
+    }
+    export -f kubectl
+    result=0; check_container_runtime >/dev/null 2>&1 || result=$?
+    [[ $result -ne 0 ]]
+  '
+
+  _t "check_container_runtime FAILS with docker message when docker found" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"containerRuntimeVersion"*)
+          printf "node1\tdocker://24.0.5\nnode2\tcontainerd://1.7.11\n";;
+        *) echo "mock" >&2; return 1;;
+      esac
+    }
+    export -f kubectl
+    output=$(check_container_runtime 2>&1); rc=$?
+    [[ $rc -ne 0 ]] && echo "$output" | grep -qi "docker"
+  '
+
+  _setup_mock_kubectl
+
+  # ─── Unit tests: check_cni ────────────────────────────────────────────────
+  echo ""
+  echo "━━━ Unit tests: check_cni ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  _t "check_cni passes when Calico is installed (any version)" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"calico-node"*"calico-system"*)
+          echo "docker.io/calico/node:v3.27.0";;
+        *) return 1;;
+      esac
+    }
+    export -f kubectl
+    check_cni
+  '
+
+  _t "check_cni passes when Flannel is installed (any version)" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"calico-node"*"calico-system"*) return 1;;
+        *"kube-flannel-ds"*"kube-flannel"*)
+          echo "docker.io/flannel/flannel:v0.23.0";;
+        *) return 1;;
+      esac
+    }
+    export -f kubectl
+    check_cni
+  '
+
+  _t "check_cni passes when Cilium 1.16.x is installed" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"calico-node"*"calico-system"*) return 1;;
+        *"kube-flannel-ds"*"kube-flannel"*) return 1;;
+        *"cilium"*"kube-system"*)
+          echo "quay.io/cilium/cilium:v1.16.4";;
+        *) return 1;;
+      esac
+    }
+    export -f kubectl
+    check_cni
+  '
+
+  _t "check_cni passes when Cilium 1.17.x is installed" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"calico-node"*"calico-system"*) return 1;;
+        *"kube-flannel-ds"*"kube-flannel"*) return 1;;
+        *"cilium"*"kube-system"*)
+          echo "quay.io/cilium/cilium:v1.17.1";;
+        *) return 1;;
+      esac
+    }
+    export -f kubectl
+    check_cni
+  '
+
+  _t "check_cni passes when Cilium 1.18.x is installed" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"calico-node"*"calico-system"*) return 1;;
+        *"kube-flannel-ds"*"kube-flannel"*) return 1;;
+        *"cilium"*"kube-system"*)
+          echo "quay.io/cilium/cilium:v1.18.0";;
+        *) return 1;;
+      esac
+    }
+    export -f kubectl
+    check_cni
+  '
+
+  _t "check_cni FAILS when Cilium 1.15.x is installed" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"calico-node"*"calico-system"*) return 1;;
+        *"kube-flannel-ds"*"kube-flannel"*) return 1;;
+        *"cilium"*"kube-system"*)
+          echo "quay.io/cilium/cilium:v1.15.7";;
+        *) return 1;;
+      esac
+    }
+    export -f kubectl
+    result=0; check_cni >/dev/null 2>&1 || result=$?
+    [[ $result -ne 0 ]]
+  '
+
+  _t "check_cni FAILS when Cilium 1.19.x is installed" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"calico-node"*"calico-system"*) return 1;;
+        *"kube-flannel-ds"*"kube-flannel"*) return 1;;
+        *"cilium"*"kube-system"*)
+          echo "quay.io/cilium/cilium:v1.19.0";;
+        *) return 1;;
+      esac
+    }
+    export -f kubectl
+    result=0; check_cni >/dev/null 2>&1 || result=$?
+    [[ $result -ne 0 ]]
+  '
+
+  _t "check_cni WARNS (not fails) when no known CNI detected" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() { return 1; }
+    export -f kubectl
+    check_cni
+  '
+
+  _setup_mock_kubectl
+
 else
   echo "  ⚠️  Skipped (script not found)"
 fi
@@ -985,6 +1175,20 @@ PODSPEC
   else
     echo "  ⚠️  Vault tests skipped (pass --vault=HOST --vault-account=/path/to/vault-file.key)"
   fi
+
+  _t "container runtime is containerd or cri-o on all nodes" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    export KUBECONFIG='"${_KUBE_PATH}"'
+    check_container_runtime
+  '
+
+  _t "CNI plugin detected and supported" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    export KUBECONFIG='"${_KUBE_PATH}"'
+    check_cni
+  '
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════

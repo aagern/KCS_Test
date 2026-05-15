@@ -5,7 +5,23 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$SCRIPT_DIR/kcs_k8s_check.sh"
-KUBECONFIG_ARG="${1:-}"
+
+# Parse args — supports multiple flags in any order
+KUBECONFIG_ARG=""
+INTEGRATION_EXTERNAL_DB=""
+INTEGRATION_EXTERNAL_DB_USER="postgres"
+INTEGRATION_EXTERNAL_DB_PASSWORD=""
+
+for _arg in "$@"; do
+  case "$_arg" in
+    --kubeconfig=*) KUBECONFIG_ARG="$_arg";;
+    --external-db=*) INTEGRATION_EXTERNAL_DB="${_arg#*=}";;
+    --external-db-user=*) INTEGRATION_EXTERNAL_DB_USER="${_arg#*=}";;
+    --external-db-password=*) INTEGRATION_EXTERNAL_DB_PASSWORD="${_arg#*=}";;
+    --kubeconfig) ;; # handled as next arg below — not currently needed
+    *) echo "Unknown test arg: $_arg" >&2;;
+  esac
+done
 
 # ── test framework ────────────────────────────────────────────────────────────
 _PASS=0; _FAIL=0
@@ -357,6 +373,98 @@ fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""
+echo "━━━ Unit tests: check_external_db ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+  _t "parse_args: --external-db sets EXTERNAL_DB_HOST" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    EXTERNAL_DB_HOST=""
+    parse_args --external-db 192.168.1.100
+    [[ "$EXTERNAL_DB_HOST" == "192.168.1.100" ]]
+  '
+
+  _t "parse_args: --external-db-user sets EXTERNAL_DB_USER" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    EXTERNAL_DB_USER=""
+    parse_args --external-db-user alice
+    [[ "$EXTERNAL_DB_USER" == "alice" ]]
+  '
+
+  _t "parse_args: --external-db-password sets EXTERNAL_DB_PASSWORD" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    EXTERNAL_DB_PASSWORD=""
+    parse_args --external-db-password s3cr3t
+    [[ "$EXTERNAL_DB_PASSWORD" == "s3cr3t" ]]
+  '
+
+  _t "check_external_db skips (PASS) when EXTERNAL_DB_HOST not set" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    EXTERNAL_DB_HOST=""
+    kubectl() { echo "mock"; }
+    export -f kubectl
+    check_external_db
+  '
+
+  # check_external_db PASS case — mock pod completes with DB_CONNECT_OK
+  EXTERNAL_DB_HOST="192.168.1.100"
+  EXTERNAL_DB_USER="kcs_user"
+  EXTERNAL_DB_PASSWORD="secret"
+  kubectl() {
+    case "$*" in
+      *"apply -f"*)                          echo "pod/kcs-precheck-db created";;
+      *"get pod"*"kcs-precheck-db"*)         echo "Succeeded";;
+      *"logs"*"kcs-precheck-db"*)            echo "DB_CONNECT_OK";;
+      *"delete pod"*)                        echo "pod deleted";;
+      *)                                     echo "mock";;
+    esac
+  }
+  export -f kubectl
+  _t "check_external_db PASSES when pod reports DB_CONNECT_OK" \
+    check_external_db
+
+  # check_external_db FAIL case — mock pod reports authentication failure
+  kubectl() {
+    case "$*" in
+      *"apply -f"*)                          echo "pod/kcs-precheck-db created";;
+      *"get pod"*"kcs-precheck-db"*)         echo "Succeeded";;
+      *"logs"*"kcs-precheck-db"*)            echo "DB_CONNECT_FAIL";;
+      *"delete pod"*)                        echo "pod deleted";;
+      *)                                     echo "mock";;
+    esac
+  }
+  export -f kubectl
+  _t "check_external_db FAILS when pod reports DB_CONNECT_FAIL" \
+    _assert_check_fails check_external_db
+
+  # check_external_db WARN case — pod never completes (DB_CHECK_TIMEOUT=0 skips loop)
+  DB_CHECK_TIMEOUT=0
+  kubectl() {
+    case "$*" in
+      *"apply -f"*)   echo "pod/kcs-precheck-db created";;
+      *"delete pod"*) echo "pod deleted";;
+      *)              echo "mock";;
+    esac
+  }
+  export -f kubectl
+  _t "check_external_db WARNS (not fails) when pod times out" \
+    check_external_db
+
+  # Reset state
+  EXTERNAL_DB_HOST=""
+  EXTERNAL_DB_USER=""
+  EXTERNAL_DB_PASSWORD=""
+  unset DB_CHECK_TIMEOUT
+  _setup_mock_kubectl
+else
+  echo "  ⚠️  Skipped (script not found)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
 echo "━━━ Integration tests: real cluster ($KUBECONFIG_ARG) ━━━━━━━━━━━━━━━━━"
 
 if [[ -z "$KUBECONFIG_ARG" ]]; then
@@ -481,6 +589,41 @@ else
     result=\$(kubectl --kubeconfig=${_KUBE_PATH} logs \"\$podname\" -n default 2>/dev/null || echo \"\")
     [[ \"\$result\" == BTF_OK ]]
   "
+
+  if [[ -n "$INTEGRATION_EXTERNAL_DB" ]]; then
+    _t "external PostgreSQL reachable from cluster (pg_isready + psql SELECT 1)" bash -c "
+      podname=\"kcs-db-inttest-\$RANDOM\"
+      trap 'kubectl --kubeconfig=${_KUBE_PATH} delete pod \"\$podname\" \
+        -n default --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true' EXIT
+      kubectl --kubeconfig=${_KUBE_PATH} apply -f - >/dev/null 2>&1 <<PODSPEC
+apiVersion: v1
+kind: Pod
+metadata:
+  name: \${podname}
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+  - name: check
+    image: postgres:15-alpine
+    env:
+    - name: PGPASSWORD
+      value: \"${INTEGRATION_EXTERNAL_DB_PASSWORD}\"
+    command: [\"sh\", \"-c\", \"pg_isready -h ${INTEGRATION_EXTERNAL_DB} -p 5432 -U ${INTEGRATION_EXTERNAL_DB_USER} -t 10 2>/dev/null && psql -h ${INTEGRATION_EXTERNAL_DB} -p 5432 -U ${INTEGRATION_EXTERNAL_DB_USER} -c 'SELECT 1' postgres >/dev/null 2>&1 && echo DB_CONNECT_OK || echo DB_CONNECT_FAIL\"]
+PODSPEC
+      elapsed=0; phase=\"\"
+      while [[ \$elapsed -lt 90 ]]; do
+        phase=\$(kubectl --kubeconfig=${_KUBE_PATH} get pod \"\$podname\" -n default \
+          -o jsonpath='{.status.phase}' 2>/dev/null || echo \"\")
+        [[ \"\$phase\" == Succeeded || \"\$phase\" == Failed ]] && break
+        sleep 3; elapsed=\$((elapsed+3))
+      done
+      result=\$(kubectl --kubeconfig=${_KUBE_PATH} logs \"\$podname\" -n default 2>/dev/null | tail -1 || echo \"\")
+      [[ \"\$result\" == DB_CONNECT_OK ]]
+    "
+  else
+    echo "  ⚠️  External PostgreSQL test skipped (pass --external-db=HOST --external-db-user=USER --external-db-password=PASS)"
+  fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════

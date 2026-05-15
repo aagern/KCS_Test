@@ -352,6 +352,14 @@ check_storage() {
   local sc_field=""
   [[ -n "$STORAGE_CLASS" ]] && sc_field="  storageClassName: ${STORAGE_CLASS}"
 
+  # WaitForFirstConsumer SCs don't bind until a consumer pod is scheduled
+  local binding_mode=""
+  if [[ -n "$STORAGE_CLASS" ]]; then
+    binding_mode=$(kubectl get storageclass "$STORAGE_CLASS" \
+      -o jsonpath='{.volumeBindingMode}' 2>/dev/null || echo "")
+  fi
+  detail+="\n**StorageClass binding mode:** ${binding_mode:-Immediate}\n"
+
   print_info "Creating test PVC '${pvc_name}' in namespace 'default'..."
   kubectl apply -f - >/dev/null 2>&1 <<PVCYAML
 apiVersion: v1
@@ -367,8 +375,36 @@ spec:
 ${sc_field}
 PVCYAML
 
+  local pvc_consumer_pod=""
+  local pvc_timeout=$PVC_BIND_TIMEOUT
+  if [[ "$binding_mode" == "WaitForFirstConsumer" ]]; then
+    pvc_consumer_pod="kcs-precheck-pvc-pod-${RANDOM}"
+    pvc_timeout=$POD_POLL_TIMEOUT
+    print_info "StorageClass uses WaitForFirstConsumer — creating consumer pod '${pvc_consumer_pod}'..."
+    kubectl apply -f - >/dev/null 2>&1 <<PODSPEC
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pvc_consumer_pod}
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+  - name: pvc-test
+    image: busybox:1.36
+    command: ["sh", "-c", "true"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: ${pvc_name}
+PODSPEC
+  fi
+
   local bound=0 elapsed=0
-  while [[ $elapsed -lt $PVC_BIND_TIMEOUT ]]; do
+  while [[ $elapsed -lt $pvc_timeout ]]; do
     local phase
     phase=$(kubectl get pvc "$pvc_name" -n default \
       -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
@@ -378,12 +414,18 @@ PVCYAML
     sleep 2; elapsed=$(( elapsed + 2 ))
   done
 
+  # Consumer pod cleanup is handled inline — CLEANUP_POD_NAME is reserved for check_registry
+  if [[ -n "$pvc_consumer_pod" ]]; then
+    kubectl delete pod "$pvc_consumer_pod" -n default \
+      --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true
+  fi
+
   if [[ $bound -eq 1 ]]; then
     print_pass "Test PVC bound (StorageClass '${STORAGE_CLASS:-default}')"
     detail+="\n**D3 PVC bind test:** PASS\n"
   else
-    print_fail "Test PVC did not bind within ${PVC_BIND_TIMEOUT}s"
-    detail+="\n**D3 PVC bind test:** FAIL — PVC stuck pending after ${PVC_BIND_TIMEOUT}s\n"
+    print_fail "Test PVC did not bind within ${pvc_timeout}s"
+    detail+="\n**D3 PVC bind test:** FAIL — PVC stuck pending after ${pvc_timeout}s\n"
     fail=1
   fi
 
@@ -463,32 +505,35 @@ check_dns() {
     return 0
   fi
 
-  local detail="" lb_ip="" resolved_ip=""
+  local detail="" resolved_ip=""
 
-  # Find ingress LoadBalancer IP (check IP and hostname)
-  local lb_ip_field lb_host_field
-  lb_ip_field=$(kubectl get svc -A \
+  # Collect ALL LoadBalancer IPs — using head -1 would pick the wrong service
+  # when multiple LB services exist (e.g. ingress + mailhog)
+  local all_lb_ips
+  all_lb_ips=$(kubectl get svc -A \
     -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.status.loadBalancer.ingress[0].ip}{"\n"}{end}' \
-    2>/dev/null | grep -v "^$" | head -1 || true)
-  lb_host_field=$(kubectl get svc -A \
-    -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.status.loadBalancer.ingress[0].hostname}{"\n"}{end}' \
-    2>/dev/null | grep -v "^$" | head -1 || true)
+    2>/dev/null | grep -v "^$" | sort -u || true)
 
-  detail+="**LB IP:** ${lb_ip_field:-none}\n"
-  detail+="**LB hostname:** ${lb_host_field:-none}\n"
-
-  if [[ -n "$lb_ip_field" ]]; then
-    lb_ip="$lb_ip_field"
-  elif [[ -n "$lb_host_field" ]]; then
-    # Resolve hostname to IP
-    if command -v dig >/dev/null 2>&1; then
-      lb_ip=$(dig +short "$lb_host_field" | grep -E '^[0-9]+\.' | head -1 || true)
-    elif command -v nslookup >/dev/null 2>&1; then
-      lb_ip=$(nslookup "$lb_host_field" 2>/dev/null \
-        | awk '/^Address: /{print $2}' | head -1 || true)
+  if [[ -z "$all_lb_ips" ]]; then
+    # No direct IPs — try to resolve LB hostnames (e.g. AWS ELB)
+    local lb_hosts
+    lb_hosts=$(kubectl get svc -A \
+      -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.status.loadBalancer.ingress[0].hostname}{"\n"}{end}' \
+      2>/dev/null | grep -v "^$" || true)
+    if [[ -n "$lb_hosts" ]]; then
+      while IFS= read -r h; do
+        local resolved=""
+        if command -v dig >/dev/null 2>&1; then
+          resolved=$(dig +short "$h" | grep -E '^[0-9]+\.' | head -1 || true)
+        elif command -v nslookup >/dev/null 2>&1; then
+          resolved=$(nslookup "$h" 2>/dev/null | awk '/^Address: /{print $2}' | head -1 || true)
+        fi
+        [[ -n "$resolved" ]] && all_lb_ips+="${resolved}"$'\n'
+      done <<< "$lb_hosts"
     fi
-    detail+="**LB resolved IP:** ${lb_ip:-unresolved}\n"
   fi
+
+  detail+="**Cluster LB IPs:** $(echo "$all_lb_ips" | grep -v "^$" | tr '\n' ' ' || echo 'none')\n"
 
   # Resolve domain
   if command -v dig >/dev/null 2>&1; then
@@ -507,9 +552,9 @@ check_dns() {
     return 0
   fi
 
-  if [[ -n "$lb_ip" ]] && [[ "$resolved_ip" != "$lb_ip" ]]; then
-    print_warn "Domain '${DOMAIN}' resolves to ${resolved_ip} but LB IP is ${lb_ip}"
-    detail+="**Match:** WARN — mismatch between domain IP and LB IP\n"
+  if [[ -n "$all_lb_ips" ]] && ! echo "$all_lb_ips" | grep -qFx "$resolved_ip"; then
+    print_warn "Domain '${DOMAIN}' resolves to ${resolved_ip} but doesn't match any cluster LB IP ($(echo "$all_lb_ips" | grep -v "^$" | tr '\n' ' '))"
+    detail+="**Match:** WARN — ${resolved_ip} not among cluster LB IPs\n"
     record_result "F. DNS domain" "⚠️ WARN" "$detail"
   else
     print_pass "Domain '${DOMAIN}' resolves to ${resolved_ip}"

@@ -28,6 +28,12 @@ REGISTRY_TEST_IMAGE="${REGISTRY_TEST_IMAGE:-curlimages/curl:latest}"
 SKIP_DNS_CHECK="${SKIP_DNS_CHECK:-}"
 SKIP_REGISTRY_CHECK="${SKIP_REGISTRY_CHECK:-}"
 
+EXTERNAL_DB_HOST="${EXTERNAL_DB_HOST:-}"
+EXTERNAL_DB_USER="${EXTERNAL_DB_USER:-postgres}"
+EXTERNAL_DB_PASSWORD="${EXTERNAL_DB_PASSWORD:-}"
+EXTERNAL_DB_PORT="${EXTERNAL_DB_PORT:-5432}"
+DB_CHECK_TIMEOUT="${DB_CHECK_TIMEOUT:-60}"
+
 # Filled by cleanup() trap
 CLEANUP_NAMESPACE=""
 CLEANUP_PVC_NAME=""
@@ -188,6 +194,25 @@ gather_inputs() {
     read -rp "  Expected IngressClass name (leave blank = any): " INGRESS_CLASS
   fi
 }
+
+# ── CLI argument parsing ──────────────────────────────────────────────────────
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --external-db)
+        EXTERNAL_DB_HOST="$2"; shift 2;;
+      --external-db-user)
+        EXTERNAL_DB_USER="$2"; shift 2;;
+      --external-db-password)
+        EXTERNAL_DB_PASSWORD="$2"; shift 2;;
+      *)
+        echo "Unknown option: $1" >&2
+        echo "Usage: $0 [--external-db HOST] [--external-db-user USER] [--external-db-password PASS]" >&2
+        exit 1;;
+    esac
+  done
+}
+export -f parse_args
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CHECK A — Kubernetes version
@@ -801,6 +826,87 @@ PODSPEC
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CHECK J — External PostgreSQL database
+# ═══════════════════════════════════════════════════════════════════════════════
+check_external_db() {
+  print_header "J. External PostgreSQL database"
+
+  if [[ -z "${EXTERNAL_DB_HOST:-}" ]]; then
+    print_info "External DB check skipped (--external-db not provided)"
+    record_result "J. External PostgreSQL" "⚠️ SKIP" "No external DB host specified — check skipped."
+    return 0
+  fi
+
+  local pod_name="kcs-precheck-db-${RANDOM}"
+  local host="${EXTERNAL_DB_HOST}"
+  local port="${EXTERNAL_DB_PORT:-5432}"
+  local user="${EXTERNAL_DB_USER:-postgres}"
+  local pass="${EXTERNAL_DB_PASSWORD:-}"
+  local detail=""
+  detail+="**Host:** ${host}:${port}\n"
+  detail+="**User:** ${user}\n"
+
+  print_info "Testing PostgreSQL connectivity to ${host}:${port} (user: ${user}) via cluster pod '${pod_name}'..."
+
+  kubectl apply -f - >/dev/null 2>&1 <<PODSPEC
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod_name}
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+  - name: check
+    image: postgres:15-alpine
+    env:
+    - name: PGPASSWORD
+      value: "${pass}"
+    command: ["sh", "-c", "if pg_isready -h ${host} -p ${port} -U ${user} -t 10 2>/dev/null; then if psql -h ${host} -p ${port} -U ${user} -c 'SELECT 1' postgres >/dev/null 2>&1; then echo DB_CONNECT_OK; else echo DB_CONNECT_FAIL_AUTH; fi; else echo DB_CONNECT_FAIL_NETWORK; fi"]
+PODSPEC
+
+  local timeout="${DB_CHECK_TIMEOUT:-60}"
+  local elapsed=0 phase=""
+  while [[ $elapsed -lt $timeout ]]; do
+    phase=$(kubectl get pod "$pod_name" -n default \
+      -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+    [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && break
+    sleep 2; elapsed=$(( elapsed + 2 ))
+  done
+
+  local result=""
+  [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && \
+    result=$(kubectl logs "$pod_name" -n default 2>/dev/null | tail -1 || echo "")
+
+  kubectl delete pod "$pod_name" -n default \
+    --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true
+
+  detail+="**Pod phase:** ${phase:-timeout}\n"
+
+  if [[ "$result" == "DB_CONNECT_OK" ]]; then
+    print_pass "PostgreSQL at ${host}:${port} reachable, user '${user}' authenticated"
+    record_result "J. External PostgreSQL" "✅ PASS" "$detail"
+    return 0
+  elif [[ "$result" == "DB_CONNECT_FAIL_NETWORK" ]]; then
+    print_fail "Cannot reach PostgreSQL at ${host}:${port} — host unreachable or port closed"
+    detail+="**Connection:** FAIL — network unreachable or port closed\n"
+    record_result "J. External PostgreSQL" "❌ FAIL" "$detail"
+    return 1
+  elif [[ "$result" == "DB_CONNECT_FAIL_AUTH" ]]; then
+    print_fail "PostgreSQL at ${host}:${port} is reachable but authentication failed for user '${user}'"
+    detail+="**Connection:** FAIL — authentication failed (wrong user or password)\n"
+    record_result "J. External PostgreSQL" "❌ FAIL" "$detail"
+    return 1
+  else
+    print_warn "PostgreSQL check inconclusive — pod did not complete within ${timeout}s (phase: ${phase:-unknown})"
+    detail+="**Connection:** WARN — pod timed out or image pull failed\n"
+    record_result "J. External PostgreSQL" "⚠️ WARN" "$detail"
+    return 0
+  fi
+}
+export -f check_external_db
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
 print_summary() {
@@ -863,6 +969,8 @@ finalize() {
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 main() {
+  parse_args "$@"
+
   echo -e "${_BOLD}"
   echo "  ╔══════════════════════════════════════════════════╗"
   echo "  ║   KCS 2.4 Kubernetes Pre-Installation Checker   ║"
@@ -882,6 +990,7 @@ main() {
   [[ -z "$SKIP_REGISTRY_CHECK" ]] && { check_registry || true; }
   check_os_kernel   || true
   check_ebpf        || true
+  check_external_db || true
 
   print_summary
 

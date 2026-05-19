@@ -61,7 +61,7 @@ print_info()   { echo -e "${_CYAN}  ℹ️  ${_RESET}$*"; }
 print_header() { echo -e "\n${_BOLD}━━━ $* ━━━${_RESET}"; }
 
 # ── report helpers ───────────────────────────────────────────────────────────
-append_report() { echo "$*" >> "$REPORT_FILE"; }
+append_report() { echo -e "$*" >> "$REPORT_FILE"; }
 
 init_report() {
   cat > "$REPORT_FILE" <<HEADER

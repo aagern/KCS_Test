@@ -805,8 +805,8 @@ if [[ $_SOURCED -eq 1 ]]; then
     source '"$SCRIPT"'
     kubectl() {
       case "$*" in
-        *"calico-node"*"calico-system"*)
-          echo "docker.io/calico/node:v3.27.0";;
+        *"daemonsets"*"--all-namespaces"*"calico-node"*)
+          printf "calico-system\tdocker.io/calico/node:v3.27.0\n";;
         *) return 1;;
       esac
     }
@@ -819,9 +819,9 @@ if [[ $_SOURCED -eq 1 ]]; then
     source '"$SCRIPT"'
     kubectl() {
       case "$*" in
-        *"calico-node"*"calico-system"*) return 1;;
-        *"kube-flannel-ds"*"kube-flannel"*)
-          echo "docker.io/flannel/flannel:v0.23.0";;
+        *"daemonsets"*"--all-namespaces"*"calico-node"*) return 1;;
+        *"daemonsets"*"--all-namespaces"*"kube-flannel-ds"*)
+          printf "kube-flannel\tdocker.io/flannel/flannel:v0.23.0\n";;
         *) return 1;;
       esac
     }
@@ -834,10 +834,10 @@ if [[ $_SOURCED -eq 1 ]]; then
     source '"$SCRIPT"'
     kubectl() {
       case "$*" in
-        *"calico-node"*"calico-system"*) return 1;;
-        *"kube-flannel-ds"*"kube-flannel"*) return 1;;
-        *"cilium"*"kube-system"*)
-          echo "quay.io/cilium/cilium:v1.16.4";;
+        *"daemonsets"*"--all-namespaces"*"calico-node"*) return 1;;
+        *"daemonsets"*"--all-namespaces"*"kube-flannel-ds"*) return 1;;
+        *"daemonsets"*"--all-namespaces"*"cilium"*)
+          printf "kube-system\tquay.io/cilium/cilium:v1.16.4\n";;
         *) return 1;;
       esac
     }
@@ -850,10 +850,10 @@ if [[ $_SOURCED -eq 1 ]]; then
     source '"$SCRIPT"'
     kubectl() {
       case "$*" in
-        *"calico-node"*"calico-system"*) return 1;;
-        *"kube-flannel-ds"*"kube-flannel"*) return 1;;
-        *"cilium"*"kube-system"*)
-          echo "quay.io/cilium/cilium:v1.17.1";;
+        *"daemonsets"*"--all-namespaces"*"calico-node"*) return 1;;
+        *"daemonsets"*"--all-namespaces"*"kube-flannel-ds"*) return 1;;
+        *"daemonsets"*"--all-namespaces"*"cilium"*)
+          printf "kube-system\tquay.io/cilium/cilium:v1.17.1\n";;
         *) return 1;;
       esac
     }
@@ -866,10 +866,10 @@ if [[ $_SOURCED -eq 1 ]]; then
     source '"$SCRIPT"'
     kubectl() {
       case "$*" in
-        *"calico-node"*"calico-system"*) return 1;;
-        *"kube-flannel-ds"*"kube-flannel"*) return 1;;
-        *"cilium"*"kube-system"*)
-          echo "quay.io/cilium/cilium:v1.18.0";;
+        *"daemonsets"*"--all-namespaces"*"calico-node"*) return 1;;
+        *"daemonsets"*"--all-namespaces"*"kube-flannel-ds"*) return 1;;
+        *"daemonsets"*"--all-namespaces"*"cilium"*)
+          printf "kube-system\tquay.io/cilium/cilium:v1.18.0\n";;
         *) return 1;;
       esac
     }
@@ -882,10 +882,10 @@ if [[ $_SOURCED -eq 1 ]]; then
     source '"$SCRIPT"'
     kubectl() {
       case "$*" in
-        *"calico-node"*"calico-system"*) return 1;;
-        *"kube-flannel-ds"*"kube-flannel"*) return 1;;
-        *"cilium"*"kube-system"*)
-          echo "quay.io/cilium/cilium:v1.15.7";;
+        *"daemonsets"*"--all-namespaces"*"calico-node"*) return 1;;
+        *"daemonsets"*"--all-namespaces"*"kube-flannel-ds"*) return 1;;
+        *"daemonsets"*"--all-namespaces"*"cilium"*)
+          printf "kube-system\tquay.io/cilium/cilium:v1.15.7\n";;
         *) return 1;;
       esac
     }
@@ -899,10 +899,10 @@ if [[ $_SOURCED -eq 1 ]]; then
     source '"$SCRIPT"'
     kubectl() {
       case "$*" in
-        *"calico-node"*"calico-system"*) return 1;;
-        *"kube-flannel-ds"*"kube-flannel"*) return 1;;
-        *"cilium"*"kube-system"*)
-          echo "quay.io/cilium/cilium:v1.19.0";;
+        *"daemonsets"*"--all-namespaces"*"calico-node"*) return 1;;
+        *"daemonsets"*"--all-namespaces"*"kube-flannel-ds"*) return 1;;
+        *"daemonsets"*"--all-namespaces"*"cilium"*)
+          printf "kube-system\tquay.io/cilium/cilium:v1.19.0\n";;
         *) return 1;;
       esac
     }
@@ -917,6 +917,54 @@ if [[ $_SOURCED -eq 1 ]]; then
     kubectl() { return 1; }
     export -f kubectl
     check_cni
+  '
+
+  _t "check_cni passes when Calico is in kube-system (non-standard namespace)" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"daemonsets"*"--all-namespaces"*"calico-node"*)
+          printf "kube-system\tdocker.io/calico/node:v3.27.0\n";;
+        *) return 1;;
+      esac
+    }
+    export -f kubectl
+    out=$(check_cni 2>&1)
+    echo "$out" | grep -q "CNI: Calico"
+  '
+
+  _t "check_cni passes when Flannel is in kube-system (non-standard namespace)" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"daemonsets"*"--all-namespaces"*"calico-node"*) return 1;;
+        *"daemonsets"*"--all-namespaces"*"kube-flannel-ds"*)
+          printf "kube-system\tdocker.io/flannel/flannel:v0.23.0\n";;
+        *) return 1;;
+      esac
+    }
+    export -f kubectl
+    out=$(check_cni 2>&1)
+    echo "$out" | grep -q "CNI: Flannel"
+  '
+
+  _t "check_cni passes when Cilium is in a non-standard namespace" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"daemonsets"*"--all-namespaces"*"calico-node"*) return 1;;
+        *"daemonsets"*"--all-namespaces"*"kube-flannel-ds"*) return 1;;
+        *"daemonsets"*"--all-namespaces"*"cilium"*)
+          printf "cilium-system\tquay.io/cilium/cilium:v1.17.1\n";;
+        *) return 1;;
+      esac
+    }
+    export -f kubectl
+    out=$(check_cni 2>&1)
+    echo "$out" | grep -q "CNI: Cilium"
   '
 
   _setup_mock_kubectl

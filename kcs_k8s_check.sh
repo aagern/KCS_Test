@@ -1093,12 +1093,24 @@ CILIUM_SUPPORTED_VERSIONS="1.16 1.17 1.18"
 check_cni() {
   print_header "M. CNI plugin"
 
-  local detail="" cni_name="" cni_image="" cni_version=""
+  local detail="" cni_name="" cni_image="" cni_ns="" cni_version="" row
+
+  # Search for a daemonset by name across all namespaces; output: "namespace<TAB>image"
+  _cni_row() {
+    local ds_name="$1"
+    local out
+    out=$(kubectl get daemonsets --all-namespaces \
+      -o jsonpath="{range .items[?(@.metadata.name==\"${ds_name}\")]}{.metadata.namespace}{\"\t\"}{.spec.template.spec.containers[0].image}{\"\n\"}{end}" \
+      2>/dev/null || true)
+    # return only first match in case of duplicates
+    printf '%s\n' "${out%%$'\n'*}"
+  }
 
   # Try Calico
-  cni_image=$(kubectl get daemonset calico-node -n calico-system \
-    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
-  if [[ -n "$cni_image" ]]; then
+  row=$(_cni_row "calico-node")
+  if [[ -n "$row" ]]; then
+    cni_ns=$(awk -F'\t' '{print $1}' <<< "$row")
+    cni_image=$(awk -F'\t' '{print $2}' <<< "$row")
     cni_name="Calico"
     cni_version="${cni_image##*:}"
     print_pass "CNI: ${cni_name} ${cni_version} (image: ${cni_image})"
@@ -1108,9 +1120,10 @@ check_cni() {
   fi
 
   # Try Flannel
-  cni_image=$(kubectl get daemonset kube-flannel-ds -n kube-flannel \
-    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
-  if [[ -n "$cni_image" ]]; then
+  row=$(_cni_row "kube-flannel-ds")
+  if [[ -n "$row" ]]; then
+    cni_ns=$(awk -F'\t' '{print $1}' <<< "$row")
+    cni_image=$(awk -F'\t' '{print $2}' <<< "$row")
     cni_name="Flannel"
     cni_version="${cni_image##*:}"
     print_pass "CNI: ${cni_name} ${cni_version} (image: ${cni_image})"
@@ -1120,12 +1133,12 @@ check_cni() {
   fi
 
   # Try Cilium
-  cni_image=$(kubectl get daemonset cilium -n kube-system \
-    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
-  if [[ -n "$cni_image" ]]; then
+  row=$(_cni_row "cilium")
+  if [[ -n "$row" ]]; then
+    cni_ns=$(awk -F'\t' '{print $1}' <<< "$row")
+    cni_image=$(awk -F'\t' '{print $2}' <<< "$row")
     cni_name="Cilium"
     cni_version="${cni_image##*:}"
-    # strip leading 'v'
     local ver="${cni_version#v}"
     local major="${ver%%.*}"; local rest="${ver#*.}"; local minor="${rest%%.*}"
     local major_minor="${major}.${minor}"

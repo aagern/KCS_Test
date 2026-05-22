@@ -229,37 +229,107 @@ export -f parse_args
 check_k8s_version() {
   print_header "A. Kubernetes version"
 
-  local minor arch_list fail=0 detail=""
-  local major minor_raw ver_json
+  local fail=0 detail="" arch_list non_amd64
+  local ver_json ver_norm sv_block cv_block
+  local major minor_raw minor server_git client_git distro
 
   ver_json=$(kubectl version --output=json 2>/dev/null) || true
-  # Parse serverVersion from JSON using grep+sed — no python3 required
-  major=$(printf '%s\n' "$ver_json" | grep -A20 '"serverVersion"' | grep '"major"' | head -1 \
-    | sed 's/[^0-9]*\([0-9]*\).*/\1/')
-  minor_raw=$(printf '%s\n' "$ver_json" | grep -A20 '"serverVersion"' | grep '"minor"' | head -1 \
-    | sed 's/.*"minor"[^"]*"\([^"]*\)".*/\1/')
+
+  # Normalize JSON to single compact line for reliable block extraction (no python3 required)
+  ver_norm=$(printf '%s\n' "$ver_json" | tr -d '\n' \
+    | sed 's/ *: */:/g; s/ *{ */{/g; s/ *} */}/g')
+
+  # Extract serverVersion and clientVersion object bodies
+  sv_block=$(printf '%s\n' "$ver_norm" | sed 's/.*"serverVersion":{//; s/}.*//')
+  cv_block=$(printf '%s\n' "$ver_norm" | sed 's/.*"clientVersion":{//; s/}.*//')
+
+  # Parse serverVersion fields
+  major=$(printf '%s\n' "$sv_block" | grep -o '"major":"[^"]*"' | head -1 \
+    | sed 's/"major":"//; s/"$//')
+  minor_raw=$(printf '%s\n' "$sv_block" | grep -o '"minor":"[^"]*"' | head -1 \
+    | sed 's/"minor":"//; s/"$//')
+  server_git=$(printf '%s\n' "$sv_block" | grep -o '"gitVersion":"[^"]*"' | head -1 \
+    | sed 's/"gitVersion":"//; s/"$//')
+
+  # Parse clientVersion gitVersion (used for OpenShift detection)
+  client_git=$(printf '%s\n' "$cv_block" | grep -o '"gitVersion":"[^"]*"' | head -1 \
+    | sed 's/"gitVersion":"//; s/"$//')
+
   [[ -z "$major" ]]     && major="?"
   [[ -z "$minor_raw" ]] && minor_raw="?"
-  # strip non-numeric suffix ("28+" → "28")
   minor="${minor_raw//[^0-9]/}"
 
-  detail+="**Server version:** ${major}.${minor_raw}\n"
-
-  if [[ "$major" != "1" ]] || [[ -z "$minor" ]] || [[ "$minor" -lt "$MIN_K8S_MINOR" ]]; then
-    print_fail "Server version ${major}.${minor} — minimum 1.${MIN_K8S_MINOR} required"
-    detail+="**Result:** FAIL — version below minimum (1.${MIN_K8S_MINOR})\n"
-    fail=1
-  else
-    print_pass "Server version ${major}.${minor} ≥ 1.${MIN_K8S_MINOR}"
-    detail+="**Result:** PASS\n"
+  # Detect distribution from gitVersion markers
+  # K3s:       serverVersion.gitVersion contains "+k3s"
+  # RKE2:      serverVersion.gitVersion contains "+rke2r"
+  # OpenShift: clientVersion.gitVersion matches OCP pattern (N.N.N-timestamp.pN.)
+  distro="kubernetes"
+  if [[ "$server_git" == *"+k3s"* ]]; then
+    distro="k3s"
+  elif [[ "$server_git" == *"+rke2r"* ]]; then
+    distro="rke2"
+  elif [[ "$client_git" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+\.p[0-9]+\. ]]; then
+    distro="openshift"
   fi
 
-  # architecture check
+  detail+="**Server version:** ${server_git:-${major}.${minor_raw}}\n"
+  [[ "$distro" != "kubernetes" ]] && detail+="**Distribution:** ${distro}\n"
+
+  case "$distro" in
+    k3s)
+      print_fail "K3s detected (${server_git}) — K3s is not a supported distribution"
+      detail+="**Result:** FAIL — K3s is not a supported Kubernetes distribution\n"
+      fail=1
+      ;;
+
+    rke2)
+      if [[ "$major" != "1" ]] || [[ -z "$minor" ]] || [[ "$minor" -lt "$MIN_K8S_MINOR" ]]; then
+        print_fail "RKE2 Kubernetes ${major}.${minor} — minimum 1.${MIN_K8S_MINOR} required"
+        detail+="**Result:** FAIL — RKE2 Kubernetes version below minimum (1.${MIN_K8S_MINOR})\n"
+        fail=1
+      else
+        print_pass "RKE2 (Rancher 2.12) Kubernetes ${major}.${minor} ≥ 1.${MIN_K8S_MINOR}"
+        detail+="**Result:** PASS\n"
+      fi
+      ;;
+
+    openshift)
+      local ocp_major ocp_minor ocp_ok=0
+      ocp_major=$(printf '%s\n' "$client_git" | sed 's/^\([0-9]*\)\..*/\1/')
+      ocp_minor=$(printf '%s\n' "$client_git" | sed 's/^[0-9]*\.\([0-9]*\).*/\1/')
+      detail+="**OpenShift version:** ${ocp_major}.${ocp_minor}\n"
+      if [[ "$ocp_major" -gt 4 ]]; then
+        ocp_ok=1
+      elif [[ "$ocp_major" -eq 4 ]] && [[ -n "$ocp_minor" ]] && [[ "$ocp_minor" -ge 8 ]]; then
+        ocp_ok=1
+      fi
+      if [[ $ocp_ok -eq 1 ]]; then
+        print_pass "OpenShift ${ocp_major}.${ocp_minor} ≥ 4.8 — supported"
+        detail+="**Result:** PASS\n"
+      else
+        print_fail "OpenShift ${ocp_major}.${ocp_minor} — minimum 4.8 required (supported: 4.8, 4.11+)"
+        detail+="**Result:** FAIL — OpenShift version not supported (minimum 4.8)\n"
+        fail=1
+      fi
+      ;;
+
+    *)
+      if [[ "$major" != "1" ]] || [[ -z "$minor" ]] || [[ "$minor" -lt "$MIN_K8S_MINOR" ]]; then
+        print_fail "Server version ${major}.${minor} — minimum 1.${MIN_K8S_MINOR} required"
+        detail+="**Result:** FAIL — version below minimum (1.${MIN_K8S_MINOR})\n"
+        fail=1
+      else
+        print_pass "Server version ${major}.${minor} ≥ 1.${MIN_K8S_MINOR}"
+        detail+="**Result:** PASS\n"
+      fi
+      ;;
+  esac
+
+  # Architecture check
   arch_list=$(kubectl get nodes \
     -o jsonpath='{range .items[*]}{.status.nodeInfo.architecture}{"\n"}{end}' 2>/dev/null)
   detail+="\n**Node architectures:**\n\`\`\`\n${arch_list}\n\`\`\`\n"
 
-  local non_amd64
   non_amd64=$(echo "$arch_list" | grep -v "^amd64$" | grep -v "^$" || true)
   if [[ -n "$non_amd64" ]]; then
     print_warn "Non-amd64 nodes found: ${non_amd64} — KCS requires x86_64 (amd64)"

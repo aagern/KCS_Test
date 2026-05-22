@@ -268,6 +268,106 @@ fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""
+echo "━━━ Unit tests: Kubernetes distribution detection ━━━━━━━━━━━━━━━━━━━━━━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+
+  # K3s — not a supported distribution; must always ERROR regardless of K8s version
+  kubectl() {
+    case "$*" in
+      *"version"*"--output=json"*)
+        echo '{"clientVersion":{"gitVersion":"v1.34.3+k3s1"},"serverVersion":{"major":"1","minor":"34","gitVersion":"v1.34.3+k3s1"}}';;
+      *"nodeInfo.architecture"*) printf "amd64\n";;
+      *) echo "mock";;
+    esac
+  }
+  export -f kubectl
+  _t "check_k8s_version ERRORS for K3s distribution (v1.34.3+k3s1)" \
+    _assert_check_fails check_k8s_version
+
+  # OpenShift 4.18 — detected via clientVersion gitVersion; ≥ 4.8 must PASS
+  kubectl() {
+    case "$*" in
+      *"version"*"--output=json"*)
+        echo '{"clientVersion":{"gitVersion":"4.18.0-202507211933.p0.g4fcb2d0.assembly.stream.el9-4fcb2d0"},"serverVersion":{"major":"1","minor":"33","gitVersion":"v1.33.6"}}';;
+      *"nodeInfo.architecture"*) printf "amd64\n";;
+      *) echo "mock";;
+    esac
+  }
+  export -f kubectl
+  _t "check_k8s_version PASSES for OpenShift 4.18 (supported, ≥ 4.8)" \
+    check_k8s_version
+
+  # OpenShift 4.8 — minimum supported version; must PASS
+  kubectl() {
+    case "$*" in
+      *"version"*"--output=json"*)
+        echo '{"clientVersion":{"gitVersion":"4.8.0-202108042329.p0.gab0f9cf.assembly.stream"},"serverVersion":{"major":"1","minor":"21","gitVersion":"v1.21.0"}}';;
+      *"nodeInfo.architecture"*) printf "amd64\n";;
+      *) echo "mock";;
+    esac
+  }
+  export -f kubectl
+  _t "check_k8s_version PASSES for OpenShift 4.8 (minimum supported)" \
+    check_k8s_version
+
+  # OpenShift 4.7 — below minimum 4.8; must ERROR
+  kubectl() {
+    case "$*" in
+      *"version"*"--output=json"*)
+        echo '{"clientVersion":{"gitVersion":"4.7.0-202107012112.p0.g8bcacd2.assembly.stream"},"serverVersion":{"major":"1","minor":"20","gitVersion":"v1.20.0"}}';;
+      *"nodeInfo.architecture"*) printf "amd64\n";;
+      *) echo "mock";;
+    esac
+  }
+  export -f kubectl
+  _t "check_k8s_version ERRORS for OpenShift 4.7 (below minimum 4.8)" \
+    _assert_check_fails check_k8s_version
+
+  # OpenShift 4.11 — explicitly listed in KCS24 docs; must PASS
+  kubectl() {
+    case "$*" in
+      *"version"*"--output=json"*)
+        echo '{"clientVersion":{"gitVersion":"4.11.0-202211120029.p0.g3e0c89d.assembly.stream"},"serverVersion":{"major":"1","minor":"24","gitVersion":"v1.24.0"}}';;
+      *"nodeInfo.architecture"*) printf "amd64\n";;
+      *) echo "mock";;
+    esac
+  }
+  export -f kubectl
+  _t "check_k8s_version PASSES for OpenShift 4.11 (explicitly listed in docs)" \
+    check_k8s_version
+
+  # RKE2 with K8s 1.30 — meets minimum 1.21; must PASS (Rancher 2.12)
+  kubectl() {
+    case "$*" in
+      *"version"*"--output=json"*)
+        echo '{"clientVersion":{"gitVersion":"v1.30.6"},"serverVersion":{"major":"1","minor":"30","gitVersion":"v1.30.6+rke2r1"}}';;
+      *"nodeInfo.architecture"*) printf "amd64\n";;
+      *) echo "mock";;
+    esac
+  }
+  export -f kubectl
+  _t "check_k8s_version PASSES for RKE2 v1.30.6+rke2r1 (Rancher 2.12, meets K8s minimum)" \
+    check_k8s_version
+
+  # RKE2 with K8s 1.18 — below minimum 1.21; must ERROR
+  kubectl() {
+    case "$*" in
+      *"version"*"--output=json"*)
+        echo '{"clientVersion":{"gitVersion":"v1.18.0"},"serverVersion":{"major":"1","minor":"18","gitVersion":"v1.18.0+rke2r1"}}';;
+      *"nodeInfo.architecture"*) printf "amd64\n";;
+      *) echo "mock";;
+    esac
+  }
+  export -f kubectl
+  _t "check_k8s_version ERRORS for RKE2 v1.18.0+rke2r1 (below K8s minimum 1.21)" \
+    _assert_check_fails check_k8s_version
+
+  _setup_mock_kubectl
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
 echo "━━━ Unit tests: kernel version parsing ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 if [[ $_SOURCED -eq 1 ]]; then

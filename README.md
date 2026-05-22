@@ -106,11 +106,24 @@ REGISTRY_TEST_IMAGE=alpine \
 ./kcs_k8s_check.sh
 ```
 
+## Supported Kubernetes distributions
+
+Check A identifies the Kubernetes distribution from `kubectl version --output=json` and applies distribution-specific version rules:
+
+| Distribution | Detection | Minimum version | Result |
+|---|---|---|---|
+| Vanilla Kubernetes | No distribution suffix in server `gitVersion` | 1.21 | PASS if ≥ 1.21 |
+| OpenShift | Client `gitVersion` matches OCP format (`N.N.N-timestamp.pN.`) | 4.8 | PASS if ≥ 4.8 (4.8 and 4.11 explicitly listed in KCS 2.4 docs) |
+| Rancher RKE2 | Server `gitVersion` contains `+rke2r` | K8s ≥ 1.21 | PASS if embedded K8s ≥ 1.21 (Rancher 2.12) |
+| K3s | Server `gitVersion` contains `+k3s` | — | Always **FAIL** — not a supported distribution |
+
+OpenShift detection relies on the `oc` kubectl shim reporting the OCP client version. If a standard `kubectl` binary is used against an OpenShift cluster, the script falls back to treating it as vanilla Kubernetes.
+
 ## Checks performed
 
 | ID | Check | Threshold / Requirement |
 |---|---|---|
-| A | Kubernetes server version | ≥ 1.21, all nodes `amd64` |
+| A | Kubernetes version and distribution | Vanilla K8s ≥ 1.21; OpenShift ≥ 4.8; RKE2 (Rancher 2.12) K8s ≥ 1.21; K3s always fails; all nodes `amd64` |
 | B | Allocatable CPU across all nodes | ≥ 10 cores |
 | C | Allocatable memory across all nodes | ≥ 20 GiB |
 | D | StorageClass exists + test PVC binds + ephemeral storage | SC present, PVC `Bound` within 30 s, ≥ 28 GiB ephemeral |
@@ -125,6 +138,17 @@ REGISTRY_TEST_IMAGE=alpine \
 | M | CNI plugin | Detects Calico (any version), Flannel (any version), or Cilium; for Cilium, only versions 1.16, 1.17, and 1.18 are supported — any other Cilium version fails |
 
 Checks F and G are skipped when `DOMAIN` is empty or `SKIP_*` flags are set. Check J is skipped when `--external-db` is not provided. Check K is skipped when `--vault` is not provided.
+
+### Notes on check A
+
+**Check A — Kubernetes version and distribution** reads `kubectl version --output=json` and applies distribution-aware version rules:
+
+- **Vanilla Kubernetes**: server `gitVersion` has no distribution suffix (e.g. `v1.31.2`). PASS if major.minor ≥ 1.21.
+- **OpenShift**: detected when the client `gitVersion` matches the OCP release format (`N.N.N-timestamp.pN.g…`), which is present when using the `oc` kubectl shim. Supported versions are **4.8, 4.11, and any later 4.x release**. OpenShift 4.7 and below will FAIL.
+- **RKE2 (Rancher 2.12)**: detected when server `gitVersion` contains `+rke2r` (e.g. `v1.30.6+rke2r1`). PASS if the embedded Kubernetes version is ≥ 1.21; fails otherwise.
+- **K3s**: detected when server `gitVersion` contains `+k3s` (e.g. `v1.34.3+k3s1`). Always **FAIL** regardless of version — K3s is not a supported distribution for KCS 2.4.
+
+The architecture sub-check runs regardless of distribution: all nodes must report `amd64`. Non-amd64 nodes (arm64, etc.) cause a FAIL.
 
 ### Notes on checks H and I
 
@@ -265,7 +289,7 @@ The report contains the measured value, threshold, status, and raw `kubectl` out
 bash kcs_k8s_check_test.sh --kubeconfig=/path/to/kubeconfig.yaml
 ```
 
-The test suite runs unit tests (normalization helpers, kernel version parsing, mock-kubectl pass/fail cases, python3-absence check, external-DB, Vault, container runtime, and CNI checks) and integration tests against a real cluster. All 75 unit tests must pass; integration tests require `--kubeconfig=` and optionally `--external-db=` / `--vault=`.
+The test suite runs unit tests (normalization helpers, kernel version parsing, Kubernetes distribution detection, mock-kubectl pass/fail cases, python3-absence check, external-DB, Vault, container runtime, and CNI checks) and integration tests against a real cluster. All 85 unit tests must pass; integration tests require `--kubeconfig=` and optionally `--external-db=` / `--vault=`.
 
 ```bash
 # Unit tests only

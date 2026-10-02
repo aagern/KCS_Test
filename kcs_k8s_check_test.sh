@@ -40,6 +40,34 @@ _t() { # _t "name" cmd...
 _assert_eq() { [[ "$1" == "$2" ]] || { echo "    expected='$2' got='$1'" >&2; return 1; }; }
 _assert_ge()  { [[ "$1" -ge "$2" ]] || { echo "    expected>=$2 got=$1" >&2; return 1; }; }
 
+# Returns success when the wrapped command returns non-zero.
+_assert_check_fails() { "$@" && return 1 || return 0; }
+
+# Status of the most recently recorded check result.
+# CHECK_RESULTS entries are "LABEL:STATUS:DETAIL"; bash 3.2 has no [-1] index.
+_last_status() {
+  local n=${#CHECK_RESULTS[@]}
+  [[ $n -eq 0 ]] && { echo "NONE"; return; }
+  local rest="${CHECK_RESULTS[$((n-1))]#*:}"
+  echo "${rest%%:*}"
+}
+
+# _assert_status PASS|WARN|FAIL|SKIP <check function> [args...]
+# Clears CHECK_RESULTS first so the assertion sees only this check's verdict.
+# PASS/WARN/FAIL/SKIP are distinct outcomes but WARN and SKIP both return 0,
+# so the exit status alone cannot tell them apart — hence this helper.
+_assert_status() {
+  local want="$1"; shift
+  CHECK_RESULTS=()
+  "$@" >/dev/null 2>&1
+  local got; got=$(_last_status)
+  if [[ "$got" == *"$want"* ]]; then
+    return 0
+  fi
+  echo "    expected status='$want' got='$got'" >&2
+  return 1
+}
+
 # ── source helpers only (skip main) ──────────────────────────────────────────
 UNIT_TEST_MODE=1
 # shellcheck source=kcs_k8s_check.sh
@@ -50,6 +78,9 @@ if [[ ! -f "$SCRIPT" ]]; then
 else
   source "$SCRIPT"
   _SOURCED=1
+  # Unit tests must not litter the working directory with report files.
+  # Exported so the `bash -c` tests that re-source the script inherit it.
+  export REPORT_FILE=/dev/null
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -130,15 +161,21 @@ if [[ $_SOURCED -eq 1 ]]; then
         # eBPF check pods
         *"get pod"*"kcs-ebpf"*"phase"*) echo "Succeeded";;
         *"logs"*"kcs-ebpf"*) echo "BTF_OK";;
-        # CPU allocatable
+        # per-node allocatable rows: "<node name><TAB><value>"
+        # KCS 2.5.1 thresholds apply per worker node, so the mock returns
+        # three workers that each clear 13 cores / 20 GiB / 28 GiB.
         *"allocatable.cpu"*)
-          printf "4\n16\n16\n16\n";;
-        # memory allocatable
+          printf "worker1\t16\nworker2\t16\nworker3\t16\n";;
         *"allocatable.memory"*)
-          printf "7891148Ki\n32626916Ki\n32626888Ki\n32626884Ki\n";;
-        # ephemeral storage
+          printf "worker1\t32626916Ki\nworker2\t32626888Ki\nworker3\t32626884Ki\n";;
         *"ephemeral-storage"*)
-          printf "30706Mi\n66546Mi\n66546Mi\n66546Mi\n";;
+          printf "worker1\t66546Mi\nworker2\t66546Mi\nworker3\t66546Mi\n";;
+        # pod inventory (agent resource sizing)
+        *"get pods"*"--all-namespaces"*)
+          printf "pod1\npod2\npod3\n";;
+        # Gateway API absent in the default mock — IngressClass covers ingress
+        *"api-resources"*"gateway.networking.k8s.io"*) printf "";;
+        *"get gateways"*) printf "";;
         # storageclass
         *"get storageclass"*)
           echo "NAME                 PROVISIONER
@@ -171,10 +208,10 @@ ingress-nginx-controller-xxxx   1/1     Running   0";;
   _t "check_k8s_version passes for v1.31 amd64 cluster" \
     check_k8s_version
 
-  _t "check_cpu passes when total ≥ 10 cores (mock: 52 cores)" \
+  _t "check_cpu passes when every worker has ≥ 13 cores (mock: 16 each)" \
     check_cpu
 
-  _t "check_memory passes when total ≥ 20 GiB (mock: ~102 GiB)" \
+  _t "check_memory passes when every worker has ≥ 20 GiB (mock: ~31 GiB each)" \
     check_memory
 
   _t "check_storage passes with default storageclass and Bound PVC" \
@@ -194,11 +231,6 @@ echo ""
 echo "━━━ Unit tests: mock kubectl failure cases ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 if [[ $_SOURCED -eq 1 ]]; then
-  _assert_check_fails() {
-    # Returns success when the check function returns non-zero
-    "$@" && return 1 || return 0
-  }
-
   # Old Kubernetes version
   kubectl() {
     case "$*" in
@@ -212,26 +244,26 @@ if [[ $_SOURCED -eq 1 ]]; then
   _t "check_k8s_version FAILS for v1.18 (below minimum v1.21)" \
     _assert_check_fails check_k8s_version
 
-  # Insufficient CPU (only 4 cores total)
+  # Undersized worker (4 cores — KCS 2.5.1 needs 13 per worker node)
   kubectl() {
     case "$*" in
-      *"allocatable.cpu"*) printf "4\n";;
+      *"allocatable.cpu"*) printf "worker1\t4\n";;
       *) echo "mock";;
     esac
   }
   export -f kubectl
-  _t "check_cpu FAILS when total < 10 cores (mock: 4 cores)" \
+  _t "check_cpu FAILS when a worker has < 13 cores (mock: 4 cores)" \
     _assert_check_fails check_cpu
 
-  # Insufficient memory (only 8 GiB total)
+  # Undersized worker (8 GiB — KCS 2.5.1 needs 20 GB per worker node)
   kubectl() {
     case "$*" in
-      *"allocatable.memory"*) printf "8192Mi\n";;
+      *"allocatable.memory"*) printf "worker1\t8192Mi\n";;
       *) echo "mock";;
     esac
   }
   export -f kubectl
-  _t "check_memory FAILS when total < 20 GiB (mock: 8 GiB)" \
+  _t "check_memory FAILS when a worker has < 20 GiB (mock: 8 GiB)" \
     _assert_check_fails check_memory
 
   # Restore good mock for remaining tests
@@ -406,7 +438,7 @@ if [[ $_SOURCED -eq 1 ]]; then
     esac
   }
   export -f kubectl
-  _t "check_os_kernel passes when all nodes have kernel >= 5.8" \
+  _t "check_os_kernel returns 0 for kernel 6.5 (untested in 2.5.1 → WARN)" \
     check_os_kernel
 
   # Kernel >= 4.18 but < 5.8 → returns 0 (PASS with WARN)
@@ -418,7 +450,7 @@ if [[ $_SOURCED -eq 1 ]]; then
     esac
   }
   export -f kubectl
-  _t "check_os_kernel passes (with warn) when kernel >= 4.18 but < 5.8" \
+  _t "check_os_kernel returns 0 for kernel 4.18 (tested, but < 5.8 → WARN)" \
     check_os_kernel
 
   # Kernel < 4.18 → FAIL (returns 1)
@@ -1075,6 +1107,674 @@ fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""
+echo "━━━ Unit tests: version_in_list helper (KCS 2.5.1 tested-version lists) ━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+  _t "version_in_list: exact match" \
+    version_in_list "1.33" "1.21 1.23 1.28 1.30 1.31 1.32 1.33 1.34 1.35"
+
+  _t "version_in_list: patch version matches tested major.minor" \
+    version_in_list "1.33.6" "1.21 1.23 1.28 1.30 1.31 1.32 1.33 1.34 1.35"
+
+  _t "version_in_list: tested patch-level entry matches exactly" \
+    version_in_list "3.22.5" "3.22.5 3.28 3.29 3.30 3.31"
+
+  _t "version_in_list: untested version is not matched" \
+    _assert_check_fails version_in_list "1.29" "1.21 1.23 1.28 1.30 1.31"
+
+  # Guards against "1.3" matching "1.33" — list entries must align on a dot boundary
+  _t "version_in_list: no partial-digit match (1.3 vs 1.33)" \
+    _assert_check_fails version_in_list "1.3" "1.33 1.34"
+
+  _t "version_in_list: entry must not match a longer sibling (3.2 vs 3.28)" \
+    _assert_check_fails version_in_list "3.2" "3.28 3.29"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "━━━ Unit tests: Kubernetes version tiering (PASS / WARN / FAIL) ━━━━━━━━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+  _mock_k8s_version() { # _mock_k8s_version <server-json>
+    local json="$1"
+    eval "kubectl() {
+      case \"\$*\" in
+        *'version'*'--output=json'*) echo '${json}';;
+        *'nodeInfo.architecture'*) printf 'amd64\n';;
+        *) echo mock;;
+      esac
+    }"
+    export -f kubectl
+  }
+
+  # 1.33 is in the KCS 2.5.1 tested list → PASS
+  _mock_k8s_version '{"serverVersion":{"major":"1","minor":"33","gitVersion":"v1.33.6"}}'
+  _t "check_k8s_version PASSES for tested K8s 1.33" \
+    _assert_status PASS check_k8s_version
+
+  # 1.35 is the newest tested minor → PASS
+  _mock_k8s_version '{"serverVersion":{"major":"1","minor":"35","gitVersion":"v1.35.0"}}'
+  _t "check_k8s_version PASSES for tested K8s 1.35" \
+    _assert_status PASS check_k8s_version
+
+  # 1.29 is above the 1.21 floor but absent from the tested list → WARN
+  _mock_k8s_version '{"serverVersion":{"major":"1","minor":"29","gitVersion":"v1.29.0"}}'
+  _t "check_k8s_version WARNS for untested K8s 1.29 (≥ 1.21, not in tested list)" \
+    _assert_status WARN check_k8s_version
+
+  # 1.24 also above floor, untested → WARN
+  _mock_k8s_version '{"serverVersion":{"major":"1","minor":"24","gitVersion":"v1.24.0"}}'
+  _t "check_k8s_version WARNS for untested K8s 1.24" \
+    _assert_status WARN check_k8s_version
+
+  # Below the 1.21 floor → FAIL
+  _mock_k8s_version '{"serverVersion":{"major":"1","minor":"20","gitVersion":"v1.20.0"}}'
+  _t "check_k8s_version FAILS for K8s 1.20 (below minimum 1.21)" \
+    _assert_status FAIL check_k8s_version
+
+  # An untested version must still return 0 so the run continues
+  _mock_k8s_version '{"serverVersion":{"major":"1","minor":"29","gitVersion":"v1.29.0"}}'
+  _t "check_k8s_version returns 0 (non-blocking) on WARN" \
+    check_k8s_version
+
+  _setup_mock_kubectl
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "━━━ Unit tests: OpenShift version tiering (2.5.1: 4.8, 4.21) ━━━━━━━━━━━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+  _mock_ocp() { # _mock_ocp <client-gitVersion>
+    local cv="$1"
+    eval "kubectl() {
+      case \"\$*\" in
+        *'version'*'--output=json'*)
+          echo '{\"clientVersion\":{\"gitVersion\":\"${cv}\"},\"serverVersion\":{\"major\":\"1\",\"minor\":\"33\",\"gitVersion\":\"v1.33.6\"}}';;
+        *'nodeInfo.architecture'*) printf 'amd64\n';;
+        *) echo mock;;
+      esac
+    }"
+    export -f kubectl
+  }
+
+  _mock_ocp "4.21.0-202601151933.p0.gaaaaaaa.assembly.stream.el9-aaaaaaa"
+  _t "check_k8s_version PASSES for OpenShift 4.21 (tested in 2.5.1)" \
+    _assert_status PASS check_k8s_version
+
+  _mock_ocp "4.8.0-202108042329.p0.gab0f9cf.assembly.stream"
+  _t "check_k8s_version PASSES for OpenShift 4.8 (tested in 2.5.1)" \
+    _assert_status PASS check_k8s_version
+
+  # 4.18 dropped out of the tested list in 2.5.1 (was present for 2.4) → WARN
+  _mock_ocp "4.18.0-202507211933.p0.g4fcb2d0.assembly.stream.el9-4fcb2d0"
+  _t "check_k8s_version WARNS for OpenShift 4.18 (≥ 4.8, no longer tested)" \
+    _assert_status WARN check_k8s_version
+
+  _mock_ocp "4.7.0-202107012112.p0.g8bcacd2.assembly.stream"
+  _t "check_k8s_version FAILS for OpenShift 4.7 (below minimum 4.8)" \
+    _assert_status FAIL check_k8s_version
+
+  _setup_mock_kubectl
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "━━━ Unit tests: per-worker-node CPU / memory / ephemeral (2.5.1) ━━━━━━━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+  # Doc 2.5.1: each worker node needs 13 cores, 20 GB RAM, 28 GB ephemeral.
+  # Control-plane nodes are excluded via a label selector.
+  _mock_worker_rows() { # _mock_worker_rows <field-marker> <rows>
+    local marker="$1" rows="$2"
+    eval "kubectl() {
+      case \"\$*\" in
+        *'${marker}'*) printf '%s' \"\$(printf '${rows}')\";;
+        *) echo mock;;
+      esac
+    }"
+    export -f kubectl
+  }
+
+  _mock_worker_rows "allocatable.cpu" 'worker1\t13\nworker2\t16\n'
+  _t "check_cpu PASSES when every worker has ≥ 13 cores" \
+    _assert_status PASS check_cpu
+
+  _mock_worker_rows "allocatable.cpu" 'worker1\t8\nworker2\t8\n'
+  _t "check_cpu FAILS when a worker has 8 cores (< 13)" \
+    _assert_status FAIL check_cpu
+
+  _mock_worker_rows "allocatable.cpu" 'worker1\t16\nworker2\t12\n'
+  _t "check_cpu FAILS when only one worker is undersized" \
+    _assert_status FAIL check_cpu
+
+  _mock_worker_rows "allocatable.cpu" 'worker1\t12800m\n'
+  _t "check_cpu FAILS for 12800m (just below 13 cores)" \
+    _assert_status FAIL check_cpu
+
+  _mock_worker_rows "allocatable.memory" 'worker1\t20Gi\nworker2\t32Gi\n'
+  _t "check_memory PASSES when every worker has ≥ 20 GiB" \
+    _assert_status PASS check_memory
+
+  _mock_worker_rows "allocatable.memory" 'worker1\t14164572Ki\nworker2\t14164604Ki\n'
+  _t "check_memory FAILS when workers have ~13.5 GiB (< 20 GiB)" \
+    _assert_status FAIL check_memory
+
+  _mock_worker_rows "ephemeral-storage" 'worker1\t28Gi\nworker2\t64Gi\n'
+  _t "check_storage_capacity PASSES when every worker has ≥ 28 GiB ephemeral" \
+    _assert_status PASS check_storage_capacity
+
+  _mock_worker_rows "ephemeral-storage" 'worker1\t20Gi\n'
+  _t "check_storage_capacity FAILS when a worker has 20 GiB ephemeral (< 28)" \
+    _assert_status FAIL check_storage_capacity
+
+  # Single-node cluster: no node survives the worker selector, so the check
+  # falls back to all nodes and must say so rather than silently passing.
+  kubectl() {
+    case "$*" in
+      *"!node-role.kubernetes.io/control-plane"*) printf "";;
+      *"allocatable.cpu"*) printf "single\t16\n";;
+      *) echo mock;;
+    esac
+  }
+  export -f kubectl
+  _t "check_cpu WARNS on a single-node cluster (no dedicated workers)" \
+    _assert_status WARN check_cpu
+
+  _setup_mock_kubectl
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "━━━ Unit tests: kernel version tiering (2.5.1 tested kernels) ━━━━━━━━━━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+  _mock_kernel() { # _mock_kernel <rows>
+    local rows="$1"
+    eval "kubectl() {
+      case \"\$*\" in
+        *'nodeInfo.kernelVersion'*) printf '%s' \"\$(printf '${rows}')\";;
+        *) echo mock;;
+      esac
+    }"
+    export -f kubectl
+  }
+
+  _mock_kernel 'node1\tAstra Linux SE 1.8\t6.12.60-1-generic\n'
+  _t "check_os_kernel PASSES for tested kernel 6.12" \
+    _assert_status PASS check_os_kernel
+
+  _mock_kernel 'node1\tUbuntu 24.04\t6.17.0-5-generic\n'
+  _t "check_os_kernel PASSES for tested kernel 6.17 (new in 2.5.1)" \
+    _assert_status PASS check_os_kernel
+
+  _mock_kernel 'node1\tRHEL 9.4\t5.14.0-427.33.1.el9_4.x86_64\n'
+  _t "check_os_kernel PASSES for tested kernel 5.14" \
+    _assert_status PASS check_os_kernel
+
+  # 6.5 is above 5.8 but absent from the tested list → WARN, not PASS
+  _mock_kernel 'node1\tUbuntu 22.04.3 LTS\t6.5.0-14-generic\n'
+  _t "check_os_kernel WARNS for untested kernel 6.5" \
+    _assert_status WARN check_os_kernel
+
+  # 4.18 is tested, but below 5.8 → still WARN (kcs-ih needs privileged mode)
+  _mock_kernel 'node1\tCentOS 8.2.2004\t4.18.0-193.el8.x86_64\n'
+  _t "check_os_kernel WARNS for tested kernel 4.18 (< 5.8, privileged kcs-ih)" \
+    _assert_status WARN check_os_kernel
+
+  _mock_kernel 'node1\tUbuntu 16.04\t4.14.0-96.x86_64\n'
+  _t "check_os_kernel FAILS for kernel 4.14 (below minimum 4.18)" \
+    _assert_status FAIL check_os_kernel
+
+  # Astra Linux needs CONFIG_DEBUG_INFO_BTF=y — the report must call that out
+  _mock_kernel 'node1\tAstra Linux SE 1.7\t6.1.50-1-generic\n'
+  _t "check_os_kernel notes the Astra Linux BTF requirement" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"nodeInfo.kernelVersion"*) printf "node1\tAstra Linux SE 1.7\t6.1.50-1-generic\n";;
+        *) echo mock;;
+      esac
+    }
+    export -f kubectl
+    out=$(check_os_kernel 2>&1)
+    echo "$out" | grep -qi "CONFIG_DEBUG_INFO_BTF"
+  '
+
+  _setup_mock_kubectl
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "━━━ Unit tests: Calico version tiering (2.5.1: 3.22.5, 3.28–3.31) ━━━━━━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+  _mock_cni_calico() { # _mock_cni_calico <image>
+    local img="$1"
+    eval "kubectl() {
+      case \"\$*\" in
+        *'calico-node'*) printf 'calico-system\t${img}\n';;
+        *) return 1;;
+      esac
+    }"
+    export -f kubectl
+  }
+
+  _mock_cni_calico "docker.io/calico/node:v3.30.1"
+  _t "check_cni PASSES for tested Calico 3.30" \
+    _assert_status PASS check_cni
+
+  _mock_cni_calico "docker.io/calico/node:v3.31.0"
+  _t "check_cni PASSES for tested Calico 3.31" \
+    _assert_status PASS check_cni
+
+  _mock_cni_calico "docker.io/calico/node:v3.22.5"
+  _t "check_cni PASSES for tested Calico 3.22.5 (exact patch in doc)" \
+    _assert_status PASS check_cni
+
+  # 3.22.1 is NOT 3.22.5 — the doc pins the patch level for the 3.22 line
+  _mock_cni_calico "docker.io/calico/node:v3.22.1"
+  _t "check_cni WARNS for Calico 3.22.1 (doc pins 3.22.5)" \
+    _assert_status WARN check_cni
+
+  _mock_cni_calico "docker.io/calico/node:v3.27.0"
+  _t "check_cni WARNS for untested Calico 3.27" \
+    _assert_status WARN check_cni
+
+  # Flannel carries no version constraint in the doc
+  kubectl() {
+    case "$*" in
+      *"calico-node"*) return 1;;
+      *"kube-flannel-ds"*) printf "kube-flannel\tdocker.io/flannel/flannel:v0.23.0\n";;
+      *) return 1;;
+    esac
+  }
+  export -f kubectl
+  _t "check_cni PASSES for Flannel (no version constraint in doc)" \
+    _assert_status PASS check_cni
+
+  # Cilium 1.16 requires enableTCX=false — surface that in the output
+  _t "check_cni notes enableTCX=false requirement for Cilium 1.16" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    kubectl() {
+      case "$*" in
+        *"calico-node"*) return 1;;
+        *"kube-flannel-ds"*) return 1;;
+        *"cilium"*) printf "kube-system\tquay.io/cilium/cilium:v1.16.4\n";;
+        *) return 1;;
+      esac
+    }
+    export -f kubectl
+    out=$(check_cni 2>&1)
+    echo "$out" | grep -qi "enableTCX"
+  '
+
+  _setup_mock_kubectl
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "━━━ Unit tests: ingress — IngressClass or Gateway API (2.5.1) ━━━━━━━━━━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+  # IngressClass present → PASS (unchanged behaviour)
+  kubectl() {
+    case "$*" in
+      *"get ingressclass"*) printf "nginx   k8s.io/ingress-nginx\n";;
+      *"get pods"*"ingress-nginx"*) printf "ingress-nginx-controller-x   1/1   Running   0\n";;
+      *) echo mock;;
+    esac
+  }
+  export -f kubectl
+  _t "check_ingress PASSES with an IngressClass present" \
+    _assert_status PASS check_ingress
+
+  # No IngressClass but Gateway API installed and a Gateway exists → PASS
+  kubectl() {
+    case "$*" in
+      *"get ingressclass"*) printf "";;
+      *"api-resources"*"gateway.networking.k8s.io"*)
+        printf "gateways      gtw   gateway.networking.k8s.io/v1   true   Gateway\nhttproutes          gateway.networking.k8s.io/v1   true   HTTPRoute\n";;
+      *"get gateways"*) printf "kcs-gw   istio   10.0.0.5   True\n";;
+      *) echo mock;;
+    esac
+  }
+  export -f kubectl
+  _t "check_ingress PASSES with no IngressClass when a Gateway API Gateway exists" \
+    _assert_status PASS check_ingress
+
+  # Gateway API CRDs present but no Gateway object → WARN (serviceType gatewayAPI
+  # requires a pre-created Gateway, per the 2.5.1 install procedure)
+  kubectl() {
+    case "$*" in
+      *"get ingressclass"*) printf "";;
+      *"api-resources"*"gateway.networking.k8s.io"*)
+        printf "gateways      gtw   gateway.networking.k8s.io/v1   true   Gateway\n";;
+      *"get gateways"*) printf "";;
+      *) echo mock;;
+    esac
+  }
+  export -f kubectl
+  _t "check_ingress WARNS when Gateway API is installed but no Gateway exists" \
+    _assert_status WARN check_ingress
+
+  # Neither IngressClass nor Gateway API → FAIL
+  kubectl() {
+    case "$*" in
+      *"get ingressclass"*) printf "";;
+      *"api-resources"*"gateway.networking.k8s.io"*) printf "";;
+      *"get gateways"*) return 1;;
+      *) echo mock;;
+    esac
+  }
+  export -f kubectl
+  _t "check_ingress FAILS with neither IngressClass nor Gateway API" \
+    _assert_status FAIL check_ingress
+
+  _setup_mock_kubectl
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "━━━ Unit tests: check_helm (2.5.1: Helm 3.21.1, 4.1) ━━━━━━━━━━━━━━━━━━━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+  _mock_helm() { # _mock_helm <short-version-output>
+    local v="$1"
+    eval "helm() { echo '${v}'; }"
+    export -f helm
+  }
+
+  _mock_helm "v3.21.1+gabc1234"
+  _t "check_helm PASSES for tested Helm 3.21.1" \
+    _assert_status PASS check_helm
+
+  _mock_helm "v4.1.0+gdef5678"
+  _t "check_helm PASSES for tested Helm 4.1" \
+    _assert_status PASS check_helm
+
+  # 3.13.3 is a working Helm 3 but not the tested build → WARN
+  _mock_helm "v3.13.3+gc8b9489"
+  _t "check_helm WARNS for untested Helm 3.13.3" \
+    _assert_status WARN check_helm
+
+  _mock_helm "v3.20.0+gaaa"
+  _t "check_helm WARNS for untested Helm 3.20.0" \
+    _assert_status WARN check_helm
+
+  # Helm 2 cannot install KCS charts at all
+  _mock_helm "v2.17.0+gaaa"
+  _t "check_helm FAILS for Helm 2.17 (below minimum major 3)" \
+    _assert_status FAIL check_helm
+
+  # helm absent → SKIP, never a hard failure: the script may run from a host
+  # that has kubectl but not helm
+  _t "check_helm SKIPS when the helm binary is absent" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    # The surrounding tests export a helm shell function, and exported
+    # functions are inherited by this subshell — drop it so "absent" is real.
+    unset -f helm
+    FAKEDIR=$(mktemp -d); trap "rm -rf \"$FAKEDIR\"" EXIT
+    PATH="$FAKEDIR"
+    CHECK_RESULTS=()
+    check_helm >/dev/null 2>&1
+    n=${#CHECK_RESULTS[@]}
+    st=${CHECK_RESULTS[$((n-1))]#*:}; st=${st%%:*}
+    [[ "$st" == *SKIP* ]]
+  '
+
+  unset -f helm
+  _setup_mock_kubectl
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "━━━ Unit tests: external PostgreSQL version (2.5.1: 15, 17, 18) ━━━━━━━━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+  _mock_db() { # _mock_db <pod-log-line>
+    local line="$1"
+    eval "kubectl() {
+      case \"\$*\" in
+        *'apply -f'*) echo created;;
+        *'get pod'*'phase'*) echo Succeeded;;
+        *'logs'*) echo '${line}';;
+        *'delete pod'*) echo deleted;;
+        *) echo mock;;
+      esac
+    }"
+    export -f kubectl
+  }
+
+  EXTERNAL_DB_HOST="pg.example.invalid"
+  DB_CHECK_TIMEOUT=4
+
+  _mock_db "DB_CONNECT_OK:17.2"
+  _t "check_external_db PASSES for tested PostgreSQL 17" \
+    _assert_status PASS check_external_db
+
+  _mock_db "DB_CONNECT_OK:15.8"
+  _t "check_external_db PASSES for tested PostgreSQL 15" \
+    _assert_status PASS check_external_db
+
+  _mock_db "DB_CONNECT_OK:18.0"
+  _t "check_external_db PASSES for tested PostgreSQL 18 (new in 2.5.1)" \
+    _assert_status PASS check_external_db
+
+  _mock_db "DB_CONNECT_OK:16.4"
+  _t "check_external_db WARNS for untested PostgreSQL 16" \
+    _assert_status WARN check_external_db
+
+  _mock_db "DB_CONNECT_OK:13.14"
+  _t "check_external_db FAILS for PostgreSQL 13 (below minimum 15)" \
+    _assert_status FAIL check_external_db
+
+  # Connection reachable but version unreadable → still PASS on connectivity,
+  # with the version reported as unknown
+  _mock_db "DB_CONNECT_OK:"
+  _t "check_external_db WARNS when the server version cannot be read" \
+    _assert_status WARN check_external_db
+
+  _mock_db "DB_CONNECT_FAIL_NETWORK"
+  _t "check_external_db FAILS when the host is unreachable" \
+    _assert_status FAIL check_external_db
+
+  _mock_db "DB_CONNECT_FAIL_AUTH"
+  _t "check_external_db FAILS on authentication failure" \
+    _assert_status FAIL check_external_db
+
+  EXTERNAL_DB_HOST=""
+  DB_CHECK_TIMEOUT=60
+  _setup_mock_kubectl
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "━━━ Unit tests: agent resource headroom (2.5.1 agent requirements) ━━━━━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+  # Doc 2.5.1:
+  #   kube-agent  — 1 core per 2500 pods, 2 GB per 3000 pods (one per cluster)
+  #   node-agent  — 0.3 core + 300 MB per node (base)
+  #               — up to 3 cores + 5 GB per node with all features enabled
+  _t "kube_agent_cores: 1 core at 2500 pods" \
+    _assert_eq "$(kube_agent_cores 2500)" "1"
+
+  _t "kube_agent_cores: still 1 core below 2500 pods" \
+    _assert_eq "$(kube_agent_cores 45)" "1"
+
+  _t "kube_agent_cores: 2 cores at 2501 pods" \
+    _assert_eq "$(kube_agent_cores 2501)" "2"
+
+  _t "kube_agent_cores: 2 cores at 5000 pods" \
+    _assert_eq "$(kube_agent_cores 5000)" "2"
+
+  _t "kube_agent_cores: 3 cores at 5001 pods" \
+    _assert_eq "$(kube_agent_cores 5001)" "3"
+
+  _t "kube_agent_mem_gb: 2 GB at 3000 pods" \
+    _assert_eq "$(kube_agent_mem_gb 3000)" "2"
+
+  _t "kube_agent_mem_gb: 2 GB below 3000 pods" \
+    _assert_eq "$(kube_agent_mem_gb 45)" "2"
+
+  _t "kube_agent_mem_gb: 4 GB at 3001 pods" \
+    _assert_eq "$(kube_agent_mem_gb 3001)" "4"
+
+  _t "kube_agent_mem_gb: 6 GB at 6001 pods" \
+    _assert_eq "$(kube_agent_mem_gb 6001)" "6"
+
+  # Whole-check behaviour: plenty of headroom → PASS
+  kubectl() {
+    case "$*" in
+      *"get pods"*"--all-namespaces"*) printf "pod1\npod2\npod3\n";;
+      *"allocatable.cpu"*)    printf "node1\t16\nnode2\t16\nnode3\t16\n";;
+      *"allocatable.memory"*) printf "node1\t64Gi\nnode2\t64Gi\nnode3\t64Gi\n";;
+      *) echo mock;;
+    esac
+  }
+  export -f kubectl
+  _t "check_agent_resources PASSES when nodes have headroom for the agents" \
+    _assert_status PASS check_agent_resources
+
+  # Each node must still fit a node-agent at its maximum footprint (3 cores / 5 GB).
+  # 2-core nodes cannot, so the check must WARN rather than claim readiness.
+  kubectl() {
+    case "$*" in
+      *"get pods"*"--all-namespaces"*) printf "pod1\n";;
+      *"allocatable.cpu"*)    printf "node1\t2\nnode2\t2\n";;
+      *"allocatable.memory"*) printf "node1\t4Gi\nnode2\t4Gi\n";;
+      *) echo mock;;
+    esac
+  }
+  export -f kubectl
+  _t "check_agent_resources WARNS when a node cannot fit node-agent at max footprint" \
+    _assert_status WARN check_agent_resources
+
+  _setup_mock_kubectl
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "━━━ Unit tests: probe namespace is configurable ━━━━━━━━━━━━━━━━━━━━━━━━"
+
+if [[ $_SOURCED -eq 1 ]]; then
+  # Probe pods and PVCs must land in the namespace KCS will actually occupy,
+  # so namespace-scoped obstacles — ResourceQuota, LimitRange, Pod Security
+  # Admission labels — are caught before installation rather than after.
+  _t "PROBE_NAMESPACE defaults to 'default'" bash -c '
+    export UNIT_TEST_MODE=1
+    source '"$SCRIPT"'
+    [[ "$PROBE_NAMESPACE" == "default" ]]
+  '
+
+  _t "PROBE_NAMESPACE is overridable from the environment" bash -c '
+    export UNIT_TEST_MODE=1
+    export PROBE_NAMESPACE=kcs
+    source '"$SCRIPT"'
+    [[ "$PROBE_NAMESPACE" == "kcs" ]]
+  '
+
+  _t "check_registry creates its probe pod in PROBE_NAMESPACE" bash -c '
+    export UNIT_TEST_MODE=1
+    export PROBE_NAMESPACE=probe-ns
+    source '"$SCRIPT"'
+    CALLS=$(mktemp)
+    kubectl() {
+      echo "$*" >> "$CALLS"
+      case "$*" in
+        *"get pod"*"phase"*) echo "Succeeded";;
+        *"logs"*) echo "200";;
+        *) echo mock;;
+      esac
+    }
+    export -f kubectl
+    check_registry >/dev/null 2>&1
+    grep -q -- "-n probe-ns" "$CALLS"
+  '
+
+  _t "check_ebpf creates its probe pod in PROBE_NAMESPACE" bash -c '
+    export UNIT_TEST_MODE=1
+    export PROBE_NAMESPACE=probe-ns
+    source '"$SCRIPT"'
+    CALLS=$(mktemp)
+    kubectl() {
+      echo "$*" >> "$CALLS"
+      case "$*" in
+        *"custom-columns=NAME"*) printf "node1\n";;
+        *"get pod"*"phase"*) echo "Succeeded";;
+        *"logs"*) echo "BTF_OK";;
+        *) echo mock;;
+      esac
+    }
+    export -f kubectl
+    check_ebpf >/dev/null 2>&1
+    grep -q -- "-n probe-ns" "$CALLS"
+  '
+
+  _t "no check hardcodes '-n default'" \
+    _assert_check_fails grep -q -- "-n default" "$SCRIPT"
+
+  _t "no pod spec hardcodes 'namespace: default'" \
+    _assert_check_fails grep -q "namespace: default" "$SCRIPT"
+
+  _t "no check hardcodes '--namespace=default'" \
+    _assert_check_fails grep -q -- "--namespace=default" "$SCRIPT"
+
+  _setup_mock_kubectl
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "━━━ Unit tests: version strings and thresholds say 2.5.1 ━━━━━━━━━━━━━━━"
+
+if [[ -f "$SCRIPT" ]]; then
+  _t "script header names KCS 2.5.1" \
+    grep -q "KCS 2.5.1" "$SCRIPT"
+
+  _t "script no longer names KCS 2.4" \
+    _assert_check_fails grep -q "KCS 2\.4" "$SCRIPT"
+
+  _t "CPU threshold is 13 cores (13000 millicores)" \
+    grep -q "MIN_CPU_MILLICORES=13000" "$SCRIPT"
+
+  _t "K8s tested-version list is present" \
+    grep -q "K8S_TESTED_MINORS=" "$SCRIPT"
+
+  _t "kernel tested-version list is present" \
+    grep -q "KERNEL_TESTED_VERSIONS=" "$SCRIPT"
+
+  _t "Calico tested-version list is present" \
+    grep -q "CALICO_TESTED_VERSIONS=" "$SCRIPT"
+
+  _t "Helm tested-version list is present" \
+    grep -q "HELM_TESTED_VERSIONS=" "$SCRIPT"
+
+  _t "PostgreSQL tested-version list is present" \
+    grep -q "POSTGRES_TESTED_VERSIONS=" "$SCRIPT"
+
+  _t "OpenShift tested-version list is present" \
+    grep -q "OPENSHIFT_TESTED_VERSIONS=" "$SCRIPT"
+
+  _t "report banner names KCS 2.5.1" \
+    grep -q "KCS 2.5.1 Pre-Installation Check Report" "$SCRIPT"
+
+  _t "REPORT_FILE is overridable so test runs leave no report files behind" \
+    grep -q 'REPORT_FILE="${REPORT_FILE:-' "$SCRIPT"
+
+  # Subshell tests source the script in a fresh shell, so the parent's
+  # REPORT_FILE does not reach them — the override has to be exported.
+  _t "the test suite created no kcs-precheck-*.md files" bash -c '
+    ! ls '"$SCRIPT_DIR"'/kcs-precheck-*.md >/dev/null 2>&1
+  '
+
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
 echo "━━━ Integration tests: real cluster ($KUBECONFIG_ARG) ━━━━━━━━━━━━━━━━━"
 
 if [[ -z "$KUBECONFIG_ARG" ]]; then
@@ -1105,7 +1805,7 @@ else
     ! echo \"\$archs\" | grep -qv '^amd64\$'
   "
 
-  _t "total allocatable CPU ≥ 10 cores" bash -c "
+  _t "every worker node has ≥ 13 allocatable cores" bash -c "
     total=0
     while IFS= read -r v; do
       [[ -z \"\$v\" ]] && continue

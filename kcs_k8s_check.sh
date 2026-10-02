@@ -1,26 +1,67 @@
 #!/usr/bin/env bash
-# KCS 2.4 pre-installation checker — read-only, kubectl-based
+# KCS 2.5.1 pre-installation checker — read-only, kubectl-based
 # Exit 0 = all pass | Exit 1 = at least one FAIL | Exit 2 = kubectl unreachable
 set -uo pipefail
 
 # ── constants ────────────────────────────────────────────────────────────────
+# Floors — below these the solution is documented as unsupported (FAIL).
 readonly MIN_K8S_MINOR=21
-readonly MIN_CPU_MILLICORES=10000    # 10 cores
-readonly MIN_MEM_MIB=20480           # 20 GiB
-readonly MIN_EPHEMERAL_MIB=28672     # 28 GiB
-readonly PVC_BIND_TIMEOUT=30
-readonly POD_POLL_TIMEOUT=60
-readonly POD_PENDING_WARN_SEC=20
+readonly MIN_OPENSHIFT_MAJOR=4
+readonly MIN_OPENSHIFT_MINOR=8
+readonly MIN_HELM_MAJOR=3
+readonly MIN_POSTGRES_MAJOR=15
 readonly MIN_KERNEL_MAJOR=4          # kernel >= 4.18 required
 readonly MIN_KERNEL_MINOR=18
 readonly WARN_KERNEL_MAJOR=5         # kernel < 5.8 needs kcs-ih privileged mode
 readonly WARN_KERNEL_MINOR=8
 
+# Per-worker-node capacity. The documentation states these figures for a
+# worker node in a three-worker / three-kcs-ih cluster scanning images of up
+# to 10 GB — not as a cluster-wide total — so each worker is measured on its
+# own and the control plane is excluded.
+readonly MIN_CPU_MILLICORES=13000    # 13 cores per worker node
+readonly MIN_MEM_MIB=20480           # 20 GiB per worker node
+readonly MIN_EPHEMERAL_MIB=28672     # 28 GiB per worker node
+
+# Agent sizing. kube-agent runs once per serviced cluster; node-agent is a
+# DaemonSet, so its figures are per node.
+readonly KUBE_AGENT_PODS_PER_CORE=2500
+readonly KUBE_AGENT_PODS_PER_2GB=3000
+readonly NODE_AGENT_BASE_MILLICORES=300
+readonly NODE_AGENT_BASE_MIB=300
+readonly NODE_AGENT_MAX_MILLICORES=3000   # all optional features enabled
+readonly NODE_AGENT_MAX_MIB=5120          # 5 GB
+
+# Versions covered by Kaspersky's configuration tests for this release.
+# The documentation is explicit that absence from a list is neither proof of
+# incompatibility nor a guarantee of support, so an unlisted version that
+# still clears the floor is reported as WARN, never FAIL.
+readonly K8S_TESTED_MINORS="21 23 28 30 31 32 33 34 35"
+readonly OPENSHIFT_TESTED_VERSIONS="4.8 4.21"
+readonly KERNEL_TESTED_VERSIONS="4.18 4.19 5.4 5.10 5.14 5.15 6.1 6.6 6.8 6.12 6.17"
+readonly CALICO_TESTED_VERSIONS="3.22.5 3.28 3.29 3.30 3.31"
+readonly CILIUM_TESTED_VERSIONS="1.16 1.17 1.18"
+readonly HELM_TESTED_VERSIONS="3.21.1 4.1"
+readonly POSTGRES_TESTED_VERSIONS="15 17 18"
+
+readonly PVC_BIND_TIMEOUT=30
+readonly POD_POLL_TIMEOUT=60
+readonly POD_PENDING_WARN_SEC=20
+
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-REPORT_FILE="kcs-precheck-${TIMESTAMP}.md"
+# Overridable so a test run, or a caller that wants the report elsewhere, can
+# redirect it without the script writing into the current directory.
+REPORT_FILE="${REPORT_FILE:-kcs-precheck-${TIMESTAMP}.md}"
 
 # ── env vars (overridable for non-interactive / CI use) ──────────────────────
 TARGET_NAMESPACE="${TARGET_NAMESPACE:-kcs}"
+
+# Namespace the temporary probe pods and PVC are created in. It defaults to
+# "default" so the checker stays harmless on an unprepared cluster, but
+# pointing it at the namespace KCS will occupy is what surfaces namespace-
+# scoped obstacles: a ResourceQuota that rejects the probe, a LimitRange that
+# rewrites its requests, or Pod Security Admission labels that refuse it.
+PROBE_NAMESPACE="${PROBE_NAMESPACE:-default}"
 STORAGE_CLASS="${STORAGE_CLASS:-}"
 DOMAIN="${DOMAIN:-}"
 INGRESS_CLASS="${INGRESS_CLASS:-}"
@@ -65,7 +106,7 @@ append_report() { echo -e "$*" >> "$REPORT_FILE"; }
 
 init_report() {
   cat > "$REPORT_FILE" <<HEADER
-# KCS 2.4 Pre-Installation Check Report
+# KCS 2.5.1 Pre-Installation Check Report
 
 **Generated:** $(date)
 **Cluster context:** $(kubectl config current-context 2>/dev/null || echo "unknown")
@@ -92,7 +133,7 @@ record_result() {
 
 # ── cleanup trap ─────────────────────────────────────────────────────────────
 cleanup() {
-  local ns="${CLEANUP_NAMESPACE:-default}"
+  local ns="${CLEANUP_NAMESPACE:-$PROBE_NAMESPACE}"
   if [[ -n "${CLEANUP_PVC_NAME:-}" ]]; then
     kubectl delete pvc "$CLEANUP_PVC_NAME" -n "$ns" --ignore-not-found=true \
       --timeout=15s >/dev/null 2>&1 || true
@@ -168,6 +209,73 @@ kernel_ge() {
 }
 export -f kernel_ge
 
+# version_in_list "<version>" "<space-separated tested versions>"
+# Returns 0 when the version equals a list entry or extends one at a dot
+# boundary: "1.33.6" matches the entry "1.33", and "6.12.60-1-generic" matches
+# "6.12". The dot boundary is what keeps "1.3" from matching "1.33" and
+# "3.22.1" from matching the doc's pinned "3.22.5".
+version_in_list() {
+  local ver="$1" list="$2" entry
+  for entry in $list; do
+    [[ "$ver" == "$entry" ]]   && return 0
+    [[ "$ver" == "$entry".* ]] && return 0
+  done
+  return 1
+}
+export -f version_in_list
+
+# Results of the last _worker_node_rows call. These are globals rather than
+# stdout because the fallback flag has to survive alongside the rows, and a
+# command substitution would run the function in a subshell where an assignment
+# to the flag is discarded.
+WORKER_NODE_ROWS=""
+WORKER_ROWS_FALLBACK=0
+
+# _worker_node_rows '{.status.allocatable.cpu}' fills WORKER_NODE_ROWS with
+# "<node name><TAB><value>" rows for worker nodes only. The control plane is
+# excluded with a negated label selector so its smaller allocatable figures
+# cannot mask an undersized worker. WORKER_ROWS_FALLBACK becomes 1 when no node
+# lacks the control-plane role and every node had to be measured instead.
+_worker_node_rows() {
+  local field="$1" rows
+  WORKER_ROWS_FALLBACK=0
+  WORKER_NODE_ROWS=""
+
+  rows=$(kubectl get nodes \
+    -l '!node-role.kubernetes.io/control-plane,!node-role.kubernetes.io/master' \
+    -o jsonpath="{range .items[*]}{.metadata.name}{\"\t\"}${field}{\"\n\"}{end}" \
+    2>/dev/null | grep -v '^[[:space:]]*$' || true)
+
+  if [[ -z "$rows" ]]; then
+    WORKER_ROWS_FALLBACK=1
+    rows=$(kubectl get nodes \
+      -o jsonpath="{range .items[*]}{.metadata.name}{\"\t\"}${field}{\"\n\"}{end}" \
+      2>/dev/null | grep -v '^[[:space:]]*$' || true)
+  fi
+
+  WORKER_NODE_ROWS="$rows"
+}
+export -f _worker_node_rows
+
+# kube_agent_cores <pod count> — 1 core per 2500 pods in the serviced cluster,
+# never less than one core.
+kube_agent_cores() {
+  local pods="$1" cores
+  cores=$(( (pods + KUBE_AGENT_PODS_PER_CORE - 1) / KUBE_AGENT_PODS_PER_CORE ))
+  [[ "$cores" -lt 1 ]] && cores=1
+  echo "$cores"
+}
+export -f kube_agent_cores
+
+# kube_agent_mem_gb <pod count> — 2 GB per 3000 pods, never less than 2 GB.
+kube_agent_mem_gb() {
+  local pods="$1" units
+  units=$(( (pods + KUBE_AGENT_PODS_PER_2GB - 1) / KUBE_AGENT_PODS_PER_2GB ))
+  [[ "$units" -lt 1 ]] && units=1
+  echo $(( units * 2 ))
+}
+export -f kube_agent_mem_gb
+
 # ── preflight ────────────────────────────────────────────────────────────────
 preflight_check() {
   if ! kubectl cluster-info >/dev/null 2>&1; then
@@ -229,7 +337,7 @@ export -f parse_args
 check_k8s_version() {
   print_header "A. Kubernetes version"
 
-  local fail=0 detail="" arch_list non_amd64
+  local fail=0 warn=0 detail="" arch_list non_amd64
   local ver_json ver_norm sv_block cv_block
   local major minor_raw minor server_git client_git distro
 
@@ -274,6 +382,20 @@ check_k8s_version() {
 
   detail+="**Server version:** ${server_git:-${major}.${minor_raw}}\n"
   [[ "$distro" != "kubernetes" ]] && detail+="**Distribution:** ${distro}\n"
+  detail+="**Tested minors in this release:** ${K8S_TESTED_MINORS// /, } (as 1.x)\n"
+
+  # Verdict for a plain Kubernetes major.minor. Three outcomes, so the result
+  # travels in a variable rather than an exit status.
+  _k8s_minor_verdict() {
+    local maj="$1" min="$2"
+    if [[ "$maj" != "1" ]] || [[ -z "$min" ]] || [[ "$min" -lt "$MIN_K8S_MINOR" ]]; then
+      _K8S_VERDICT="FAIL"
+    elif version_in_list "$min" "$K8S_TESTED_MINORS"; then
+      _K8S_VERDICT="PASS"
+    else
+      _K8S_VERDICT="WARN"
+    fi
+  }
 
   case "$distro" in
     k3s)
@@ -282,152 +404,255 @@ check_k8s_version() {
       fail=1
       ;;
 
-    rke2)
-      if [[ "$major" != "1" ]] || [[ -z "$minor" ]] || [[ "$minor" -lt "$MIN_K8S_MINOR" ]]; then
-        print_fail "RKE2 Kubernetes ${major}.${minor} — minimum 1.${MIN_K8S_MINOR} required"
-        detail+="**Result:** FAIL — RKE2 Kubernetes version below minimum (1.${MIN_K8S_MINOR})\n"
-        fail=1
-      else
-        print_pass "RKE2 (Rancher 2.12) Kubernetes ${major}.${minor} ≥ 1.${MIN_K8S_MINOR}"
-        detail+="**Result:** PASS\n"
-      fi
+    rke2|kubernetes)
+      local label="Server version"
+      [[ "$distro" == "rke2" ]] && label="RKE2 (Rancher) Kubernetes"
+      _k8s_minor_verdict "$major" "$minor"
+      case "$_K8S_VERDICT" in
+        PASS)
+          print_pass "${label} ${major}.${minor} — tested with this KCS release"
+          detail+="**Result:** PASS — 1.${minor} is in the tested list\n"
+          ;;
+        WARN)
+          print_warn "${label} ${major}.${minor} — above the 1.${MIN_K8S_MINOR} minimum but not in the tested list; confirm with Technical Support"
+          detail+="**Result:** WARN — 1.${minor} is not in the tested list. Absence from the list is neither proof of incompatibility nor a guarantee of support.\n"
+          warn=1
+          ;;
+        *)
+          print_fail "${label} ${major}.${minor} — minimum 1.${MIN_K8S_MINOR} required"
+          detail+="**Result:** FAIL — version below minimum (1.${MIN_K8S_MINOR})\n"
+          fail=1
+          ;;
+      esac
       ;;
 
     openshift)
-      local ocp_major ocp_minor ocp_ok=0
+      local ocp_major ocp_minor ocp_ver
       ocp_major=$(printf '%s\n' "$client_git" | sed 's/^\([0-9]*\)\..*/\1/')
       ocp_minor=$(printf '%s\n' "$client_git" | sed 's/^[0-9]*\.\([0-9]*\).*/\1/')
-      detail+="**OpenShift version:** ${ocp_major}.${ocp_minor}\n"
-      if [[ "$ocp_major" -gt 4 ]]; then
-        ocp_ok=1
-      elif [[ "$ocp_major" -eq 4 ]] && [[ -n "$ocp_minor" ]] && [[ "$ocp_minor" -ge 8 ]]; then
-        ocp_ok=1
-      fi
-      if [[ $ocp_ok -eq 1 ]]; then
-        print_pass "OpenShift ${ocp_major}.${ocp_minor} ≥ 4.8 — supported"
-        detail+="**Result:** PASS\n"
-      else
-        print_fail "OpenShift ${ocp_major}.${ocp_minor} — minimum 4.8 required (supported: 4.8, 4.11+)"
-        detail+="**Result:** FAIL — OpenShift version not supported (minimum 4.8)\n"
-        fail=1
-      fi
-      ;;
+      ocp_ver="${ocp_major}.${ocp_minor}"
+      detail+="**OpenShift version:** ${ocp_ver}\n"
+      detail+="**Tested OpenShift versions:** ${OPENSHIFT_TESTED_VERSIONS// /, }\n"
 
-    *)
-      if [[ "$major" != "1" ]] || [[ -z "$minor" ]] || [[ "$minor" -lt "$MIN_K8S_MINOR" ]]; then
-        print_fail "Server version ${major}.${minor} — minimum 1.${MIN_K8S_MINOR} required"
-        detail+="**Result:** FAIL — version below minimum (1.${MIN_K8S_MINOR})\n"
+      if [[ "$ocp_major" -lt "$MIN_OPENSHIFT_MAJOR" ]] || \
+         { [[ "$ocp_major" -eq "$MIN_OPENSHIFT_MAJOR" ]] && [[ "$ocp_minor" -lt "$MIN_OPENSHIFT_MINOR" ]]; }; then
+        print_fail "OpenShift ${ocp_ver} — minimum ${MIN_OPENSHIFT_MAJOR}.${MIN_OPENSHIFT_MINOR} required"
+        detail+="**Result:** FAIL — OpenShift below minimum ${MIN_OPENSHIFT_MAJOR}.${MIN_OPENSHIFT_MINOR}\n"
         fail=1
+      elif version_in_list "$ocp_ver" "$OPENSHIFT_TESTED_VERSIONS"; then
+        print_pass "OpenShift ${ocp_ver} — tested with this KCS release"
+        detail+="**Result:** PASS — ${ocp_ver} is in the tested list\n"
       else
-        print_pass "Server version ${major}.${minor} ≥ 1.${MIN_K8S_MINOR}"
-        detail+="**Result:** PASS\n"
+        print_warn "OpenShift ${ocp_ver} — above the ${MIN_OPENSHIFT_MAJOR}.${MIN_OPENSHIFT_MINOR} minimum but not in the tested list; confirm with Technical Support"
+        detail+="**Result:** WARN — ${ocp_ver} is not in the tested list\n"
+        warn=1
       fi
       ;;
   esac
 
-  # Architecture check
+  # Architecture — the solution supports x86 (amd64) only
   arch_list=$(kubectl get nodes \
     -o jsonpath='{range .items[*]}{.status.nodeInfo.architecture}{"\n"}{end}' 2>/dev/null)
   detail+="\n**Node architectures:**\n\`\`\`\n${arch_list}\n\`\`\`\n"
 
   non_amd64=$(echo "$arch_list" | grep -v "^amd64$" | grep -v "^$" || true)
   if [[ -n "$non_amd64" ]]; then
-    print_warn "Non-amd64 nodes found: ${non_amd64} — KCS requires x86_64 (amd64)"
-    detail+="**Architecture:** WARN — non-amd64 nodes detected\n"
+    print_fail "Non-amd64 nodes found: ${non_amd64} — KCS supports x86_64 (amd64) only"
+    detail+="**Architecture:** FAIL — non-amd64 nodes detected\n"
     fail=1
   else
     print_pass "All nodes are amd64"
     detail+="**Architecture:** PASS — all nodes amd64\n"
   fi
 
-  if [[ $fail -eq 0 ]]; then
-    record_result "A. Kubernetes version" "✅ PASS" "$detail"
-    return 0
-  else
+  if [[ $fail -eq 1 ]]; then
     record_result "A. Kubernetes version" "❌ FAIL" "$detail"
     return 1
+  elif [[ $warn -eq 1 ]]; then
+    record_result "A. Kubernetes version" "⚠️ WARN" "$detail"
+    return 0
   fi
+  record_result "A. Kubernetes version" "✅ PASS" "$detail"
+  return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CHECK B — CPU capacity
 # ═══════════════════════════════════════════════════════════════════════════════
 check_cpu() {
-  print_header "B. CPU capacity"
+  print_header "B. CPU capacity (per worker node)"
 
-  local total_mc=0 raw_values detail=""
+  local fail=0 warn=0 detail="" rows total_mc=0 node_count=0
 
-  raw_values=$(kubectl get nodes \
-    -o jsonpath='{range .items[*]}{.status.allocatable.cpu}{"\n"}{end}' 2>/dev/null)
+  _worker_node_rows '{.status.allocatable.cpu}'
+  rows="$WORKER_NODE_ROWS"
 
-  while IFS= read -r v; do
-    [[ -z "$v" ]] && continue
-    total_mc=$(( total_mc + $(normalize_cpu "$v") ))
-  done <<< "$raw_values"
+  detail+="**Threshold:** ≥ ${MIN_CPU_MILLICORES} millicores ($(( MIN_CPU_MILLICORES / 1000 )) cores) per worker node\n\n"
 
-  local total_cores=$(( total_mc / 1000 ))
-  detail="**Allocatable CPU per node:**\n\`\`\`\n${raw_values}\n\`\`\`\n"
-  detail+="**Total:** ${total_mc} millicores (${total_cores} cores)\n"
-  detail+="**Threshold:** ≥ ${MIN_CPU_MILLICORES} millicores ($(( MIN_CPU_MILLICORES / 1000 )) cores)\n"
+  if [[ "$WORKER_ROWS_FALLBACK" -eq 1 ]]; then
+    print_warn "No worker-only nodes found — measuring every node, control plane included"
+    detail+="**Node selection:** WARN — no node lacks the control-plane role, so all nodes were measured\n"
+    warn=1
+  fi
 
-  if [[ "$total_mc" -ge "$MIN_CPU_MILLICORES" ]]; then
-    print_pass "Total CPU: ${total_cores} cores (${total_mc}m) ≥ $(( MIN_CPU_MILLICORES / 1000 )) cores"
-    record_result "B. CPU capacity" "✅ PASS" "$detail"
-    return 0
-  else
-    print_fail "Total CPU: ${total_cores} cores — minimum $(( MIN_CPU_MILLICORES / 1000 )) cores required"
-    detail+="**Result:** FAIL\n"
+  local node_name value mc
+  while IFS=$'\t' read -r node_name value; do
+    [[ -z "$node_name" ]] && continue
+    mc=$(normalize_cpu "$value")
+    total_mc=$(( total_mc + mc ))
+    node_count=$(( node_count + 1 ))
+    if [[ "$mc" -ge "$MIN_CPU_MILLICORES" ]]; then
+      print_pass "Node ${node_name}: ${mc}m ($(( mc / 1000 )) cores)"
+      detail+="**${node_name}:** PASS — ${mc}m\n"
+    else
+      print_fail "Node ${node_name}: ${mc}m ($(( mc / 1000 )) cores) — minimum $(( MIN_CPU_MILLICORES / 1000 )) cores per worker node"
+      detail+="**${node_name}:** FAIL — ${mc}m is below ${MIN_CPU_MILLICORES}m\n"
+      fail=1
+    fi
+  done <<< "$rows"
+
+  if [[ "$node_count" -eq 0 ]]; then
+    print_fail "kubectl returned no node CPU data"
+    detail+="**Result:** FAIL — no node data returned\n"
+    fail=1
+  fi
+
+  detail+="\n**Cluster total (context only):** ${total_mc}m across ${node_count} node(s)\n"
+
+  if [[ $fail -eq 1 ]]; then
     record_result "B. CPU capacity" "❌ FAIL" "$detail"
     return 1
+  elif [[ $warn -eq 1 ]]; then
+    record_result "B. CPU capacity" "⚠️ WARN" "$detail"
+    return 0
   fi
+  record_result "B. CPU capacity" "✅ PASS" "$detail"
+  return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK C — Memory capacity
+# CHECK C — Memory capacity, per worker node
 # ═══════════════════════════════════════════════════════════════════════════════
 check_memory() {
-  print_header "C. Memory capacity"
+  print_header "C. Memory capacity (per worker node)"
 
-  local total_ki=0 raw_values detail=""
+  local fail=0 warn=0 detail="" rows total_mib=0 node_count=0
 
-  raw_values=$(kubectl get nodes \
-    -o jsonpath='{range .items[*]}{.status.allocatable.memory}{"\n"}{end}' 2>/dev/null)
+  _worker_node_rows '{.status.allocatable.memory}'
+  rows="$WORKER_NODE_ROWS"
 
-  while IFS= read -r v; do
-    [[ -z "$v" ]] && continue
-    local mib
-    mib=$(normalize_mem_mib "$v")
-    total_ki=$(( total_ki + mib * 1024 ))
-  done <<< "$raw_values"
+  detail+="**Threshold:** ≥ ${MIN_MEM_MIB} MiB ($(( MIN_MEM_MIB / 1024 )) GiB) per worker node\n\n"
 
-  local total_mib=$(( total_ki / 1024 ))
-  local total_gib=$(( total_mib / 1024 ))
+  if [[ "$WORKER_ROWS_FALLBACK" -eq 1 ]]; then
+    print_warn "No worker-only nodes found — measuring every node, control plane included"
+    detail+="**Node selection:** WARN — no node lacks the control-plane role, so all nodes were measured\n"
+    warn=1
+  fi
 
-  detail="**Allocatable memory per node:**\n\`\`\`\n${raw_values}\n\`\`\`\n"
-  detail+="**Total:** ${total_mib} MiB (~${total_gib} GiB)\n"
-  detail+="**Threshold:** ≥ ${MIN_MEM_MIB} MiB ($(( MIN_MEM_MIB / 1024 )) GiB)\n"
+  local node_name value mib
+  while IFS=$'\t' read -r node_name value; do
+    [[ -z "$node_name" ]] && continue
+    mib=$(normalize_mem_mib "$value")
+    total_mib=$(( total_mib + mib ))
+    node_count=$(( node_count + 1 ))
+    if [[ "$mib" -ge "$MIN_MEM_MIB" ]]; then
+      print_pass "Node ${node_name}: ${mib} MiB (~$(( mib / 1024 )) GiB)"
+      detail+="**${node_name}:** PASS — ${mib} MiB\n"
+    else
+      print_fail "Node ${node_name}: ${mib} MiB (~$(( mib / 1024 )) GiB) — minimum $(( MIN_MEM_MIB / 1024 )) GiB per worker node"
+      detail+="**${node_name}:** FAIL — ${mib} MiB is below ${MIN_MEM_MIB} MiB\n"
+      fail=1
+    fi
+  done <<< "$rows"
 
-  if [[ "$total_mib" -ge "$MIN_MEM_MIB" ]]; then
-    print_pass "Total memory: ${total_gib} GiB (${total_mib} MiB) ≥ $(( MIN_MEM_MIB / 1024 )) GiB"
-    record_result "C. Memory capacity" "✅ PASS" "$detail"
-    return 0
-  else
-    print_fail "Total memory: ${total_gib} GiB — minimum $(( MIN_MEM_MIB / 1024 )) GiB required"
-    detail+="**Result:** FAIL\n"
+  if [[ "$node_count" -eq 0 ]]; then
+    print_fail "kubectl returned no node memory data"
+    detail+="**Result:** FAIL — no node data returned\n"
+    fail=1
+  fi
+
+  detail+="\n**Cluster total (context only):** ${total_mib} MiB across ${node_count} node(s)\n"
+
+  if [[ $fail -eq 1 ]]; then
     record_result "C. Memory capacity" "❌ FAIL" "$detail"
     return 1
+  elif [[ $warn -eq 1 ]]; then
+    record_result "C. Memory capacity" "⚠️ WARN" "$detail"
+    return 0
   fi
+  record_result "C. Memory capacity" "✅ PASS" "$detail"
+  return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK D — Storage
+# CHECK D — Ephemeral storage, per worker node
+#
+# kcs-ih unpacks image layers into the node's ephemeral storage, so this is a
+# per-node requirement: a cluster-wide sum would hide a node that cannot hold
+# a single scan.
+# ═══════════════════════════════════════════════════════════════════════════════
+check_storage_capacity() {
+  print_header "D. Ephemeral storage (per worker node)"
+
+  local fail=0 warn=0 detail="" rows total_mib=0 node_count=0
+
+  _worker_node_rows '{.status.allocatable.ephemeral-storage}'
+  rows="$WORKER_NODE_ROWS"
+
+  detail+="**Threshold:** ≥ ${MIN_EPHEMERAL_MIB} MiB ($(( MIN_EPHEMERAL_MIB / 1024 )) GiB) per worker node\n\n"
+
+  if [[ "$WORKER_ROWS_FALLBACK" -eq 1 ]]; then
+    print_warn "No worker-only nodes found — measuring every node, control plane included"
+    detail+="**Node selection:** WARN — no node lacks the control-plane role, so all nodes were measured\n"
+    warn=1
+  fi
+
+  local node_name value mib
+  while IFS=$'\t' read -r node_name value; do
+    [[ -z "$node_name" ]] && continue
+    mib=$(normalize_ephemeral_mib "$value")
+    total_mib=$(( total_mib + mib ))
+    node_count=$(( node_count + 1 ))
+    if [[ "$mib" -ge "$MIN_EPHEMERAL_MIB" ]]; then
+      print_pass "Node ${node_name}: ${mib} MiB (~$(( mib / 1024 )) GiB) ephemeral"
+      detail+="**${node_name}:** PASS — ${mib} MiB\n"
+    else
+      print_fail "Node ${node_name}: ${mib} MiB (~$(( mib / 1024 )) GiB) ephemeral — minimum $(( MIN_EPHEMERAL_MIB / 1024 )) GiB per worker node"
+      detail+="**${node_name}:** FAIL — ${mib} MiB is below ${MIN_EPHEMERAL_MIB} MiB\n"
+      fail=1
+    fi
+  done <<< "$rows"
+
+  if [[ "$node_count" -eq 0 ]]; then
+    print_fail "kubectl returned no node ephemeral-storage data"
+    detail+="**Result:** FAIL — no node data returned\n"
+    fail=1
+  fi
+
+  detail+="\n**Cluster total (context only):** ${total_mib} MiB across ${node_count} node(s)\n"
+  detail+="\nPostgreSQL and ClickHouse disk sizing is calculated separately and is not covered by this check.\n"
+
+  if [[ $fail -eq 1 ]]; then
+    record_result "D. Ephemeral storage" "❌ FAIL" "$detail"
+    return 1
+  elif [[ $warn -eq 1 ]]; then
+    record_result "D. Ephemeral storage" "⚠️ WARN" "$detail"
+    return 0
+  fi
+  record_result "D. Ephemeral storage" "✅ PASS" "$detail"
+  return 0
+}
+export -f check_storage_capacity
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHECK E — StorageClass and PVC binding
 # ═══════════════════════════════════════════════════════════════════════════════
 check_storage() {
-  print_header "D. Storage"
+  print_header "E. StorageClass and PVC binding"
 
   local fail=0 detail=""
 
-  # D1: StorageClass
+  # E1: StorageClass
   local sc_list default_sc
   sc_list=$(kubectl get storageclass --no-headers 2>/dev/null || echo "")
   default_sc=$(echo "$sc_list" | grep "(default)" | awk '{print $1}' || true)
@@ -437,51 +662,27 @@ check_storage() {
   if [[ -z "$STORAGE_CLASS" ]]; then
     if [[ -z "$default_sc" ]]; then
       print_fail "No default StorageClass found and none specified"
-      detail+="**D1 StorageClass:** FAIL — no default SC\n"
+      detail+="**E1 StorageClass:** FAIL — no default SC\n"
       fail=1
     else
       print_pass "Default StorageClass: ${default_sc}"
       STORAGE_CLASS="$default_sc"
-      detail+="**D1 StorageClass:** PASS — default: ${default_sc}\n"
+      detail+="**E1 StorageClass:** PASS — default: ${default_sc}\n"
     fi
   else
     if echo "$sc_list" | grep -q "^${STORAGE_CLASS}"; then
       print_pass "StorageClass '${STORAGE_CLASS}' found"
-      detail+="**D1 StorageClass:** PASS — '${STORAGE_CLASS}' exists\n"
+      detail+="**E1 StorageClass:** PASS — '${STORAGE_CLASS}' exists\n"
     else
       print_fail "StorageClass '${STORAGE_CLASS}' not found"
-      detail+="**D1 StorageClass:** FAIL — '${STORAGE_CLASS}' missing\n"
+      detail+="**E1 StorageClass:** FAIL — '${STORAGE_CLASS}' missing\n"
       fail=1
     fi
   fi
 
-  # D2: Ephemeral storage
-  local total_eph_mi=0 eph_values
-  eph_values=$(kubectl get nodes \
-    -o jsonpath='{range .items[*]}{.status.allocatable.ephemeral-storage}{"\n"}{end}' 2>/dev/null)
-
-  while IFS= read -r v; do
-    [[ -z "$v" ]] && continue
-    total_eph_mi=$(( total_eph_mi + $(normalize_ephemeral_mib "$v") ))
-  done <<< "$eph_values"
-
-  local total_eph_gib=$(( total_eph_mi / 1024 ))
-  detail+="\n**Ephemeral storage per node:**\n\`\`\`\n${eph_values}\n\`\`\`\n"
-  detail+="**Total ephemeral:** ${total_eph_mi} MiB (~${total_eph_gib} GiB)\n"
-  detail+="**Threshold:** ≥ $(( MIN_EPHEMERAL_MIB / 1024 )) GiB\n"
-
-  if [[ "$total_eph_mi" -ge "$MIN_EPHEMERAL_MIB" ]]; then
-    print_pass "Ephemeral storage: ${total_eph_gib} GiB ≥ $(( MIN_EPHEMERAL_MIB / 1024 )) GiB"
-    detail+="**D2 Ephemeral:** PASS\n"
-  else
-    print_fail "Ephemeral storage: ${total_eph_gib} GiB — minimum $(( MIN_EPHEMERAL_MIB / 1024 )) GiB required"
-    detail+="**D2 Ephemeral:** FAIL\n"
-    fail=1
-  fi
-
-  # D3: Test PVC bind
+  # E2: Test PVC bind
   local pvc_name="kcs-precheck-test-pvc-${RANDOM}"
-  CLEANUP_NAMESPACE="default"
+  CLEANUP_NAMESPACE="$PROBE_NAMESPACE"
   CLEANUP_PVC_NAME="$pvc_name"
   local sc_field=""
   [[ -n "$STORAGE_CLASS" ]] && sc_field="  storageClassName: ${STORAGE_CLASS}"
@@ -494,13 +695,13 @@ check_storage() {
   fi
   detail+="\n**StorageClass binding mode:** ${binding_mode:-Immediate}\n"
 
-  print_info "Creating test PVC '${pvc_name}' in namespace 'default'..."
+  print_info "Creating test PVC '${pvc_name}' in namespace '${PROBE_NAMESPACE}'..."
   kubectl apply -f - >/dev/null 2>&1 <<PVCYAML
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: ${pvc_name}
-  namespace: default
+  namespace: ${PROBE_NAMESPACE}
 spec:
   accessModes: [ReadWriteOnce]
   resources:
@@ -520,7 +721,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: ${pvc_consumer_pod}
-  namespace: default
+  namespace: ${PROBE_NAMESPACE}
 spec:
   restartPolicy: Never
   containers:
@@ -540,7 +741,7 @@ PODSPEC
   local bound=0 elapsed=0
   while [[ $elapsed -lt $pvc_timeout ]]; do
     local phase
-    phase=$(kubectl get pvc "$pvc_name" -n default \
+    phase=$(kubectl get pvc "$pvc_name" -n "$PROBE_NAMESPACE" \
       -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
     if [[ "$phase" == "Bound" ]]; then
       bound=1; break
@@ -550,7 +751,7 @@ PODSPEC
 
   # Consumer pod cleanup is handled inline — CLEANUP_POD_NAME is reserved for check_registry
   if [[ -n "$pvc_consumer_pod" ]]; then
-    kubectl delete pod "$pvc_consumer_pod" -n default \
+    kubectl delete pod "$pvc_consumer_pod" -n "$PROBE_NAMESPACE" \
       --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true
   fi
 
@@ -573,69 +774,90 @@ PODSPEC
   fi
 
   if [[ $fail -eq 0 ]]; then
-    record_result "D. Storage" "✅ PASS" "$detail"
+    record_result "E. StorageClass and PVC binding" "✅ PASS" "$detail"
     return 0
   else
-    record_result "D. Storage" "❌ FAIL" "$detail"
+    record_result "E. StorageClass and PVC binding" "❌ FAIL" "$detail"
     return 1
   fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK E — Ingress controller
+# CHECK F — Ingress controller or Gateway API
 # ═══════════════════════════════════════════════════════════════════════════════
 check_ingress() {
-  print_header "E. Ingress controller"
+  print_header "F. Ingress controller / Gateway API"
 
-  local fail=0 detail=""
+  local detail="" ic_list gw_api gw_list
 
-  local ic_list
   ic_list=$(kubectl get ingressclass --no-headers 2>/dev/null || echo "")
   detail+="**IngressClasses:**\n\`\`\`\n${ic_list}\n\`\`\`\n"
 
-  if [[ -z "$ic_list" ]]; then
-    print_fail "No IngressClass resources found"
-    detail+="**Result:** FAIL — no IngressClass\n"
-    record_result "E. Ingress controller" "❌ FAIL" "$detail"
+  # An IngressClass satisfies serviceType=ingress, the common deployment.
+  if [[ -n "$ic_list" ]]; then
+    print_pass "IngressClass(es) found: $(echo "$ic_list" | awk '{print $1}' | tr '\n' ' ')"
+    detail+="**IngressClass:** PASS\n"
+
+    # Controller pods are advisory: a controller may use different labels or
+    # live in a namespace this loop does not know about.
+    local found_pods=0 ns pods
+    for ns in ingress-nginx kube-system app-routing-system; do
+      pods=$(kubectl get pods -n "$ns" \
+        -l 'app.kubernetes.io/name=ingress-nginx' \
+        --no-headers 2>/dev/null | grep -c "Running" || true)
+      if [[ "$pods" -gt 0 ]]; then
+        print_pass "Ingress controller pods running in namespace '${ns}' (${pods} pod(s))"
+        detail+="**Controller pods (${ns}):** ${pods} Running\n"
+        found_pods=1
+      fi
+    done
+    if [[ $found_pods -eq 0 ]]; then
+      print_warn "No ingress-nginx controller pods found in standard namespaces"
+      detail+="**Controller pods:** WARN — none found in ingress-nginx/kube-system/app-routing-system\n"
+    fi
+
+    record_result "F. Ingress / Gateway API" "✅ PASS" "$detail"
+    return 0
+  fi
+
+  # No IngressClass. This release also accepts serviceType=gatewayAPI, which
+  # needs the Gateway API CRDs plus a Gateway object created in advance.
+  gw_api=$(kubectl api-resources --api-group=gateway.networking.k8s.io --no-headers 2>/dev/null || echo "")
+  detail+="\n**Gateway API resources:**\n\`\`\`\n${gw_api}\n\`\`\`\n"
+
+  if [[ -z "$gw_api" ]]; then
+    print_fail "No IngressClass and no Gateway API resources found — KCS needs one or the other"
+    detail+="**Result:** FAIL — neither an IngressClass nor the Gateway API is available\n"
+    record_result "F. Ingress / Gateway API" "❌ FAIL" "$detail"
     return 1
   fi
 
-  print_pass "IngressClass(es) found: $(echo "$ic_list" | awk '{print $1}' | tr '\n' ' ')"
-  detail+="**IngressClass:** PASS\n"
+  gw_list=$(kubectl get gateways --all-namespaces --no-headers 2>/dev/null || echo "")
+  detail+="\n**Gateway objects:**\n\`\`\`\n${gw_list}\n\`\`\`\n"
 
-  # Check for running controller pods
-  local found_pods=0
-  for ns in ingress-nginx kube-system app-routing-system; do
-    local pods
-    pods=$(kubectl get pods -n "$ns" \
-      -l 'app.kubernetes.io/name=ingress-nginx' \
-      --no-headers 2>/dev/null | grep -c "Running" || true)
-    if [[ "$pods" -gt 0 ]]; then
-      print_pass "Ingress controller pods running in namespace '${ns}' (${pods} pod(s))"
-      detail+="**Controller pods (${ns}):** ${pods} Running\n"
-      found_pods=1
-    fi
-  done
-
-  if [[ $found_pods -eq 0 ]]; then
-    print_warn "No ingress-nginx controller pods found in standard namespaces"
-    detail+="**Controller pods:** WARN — none found in ingress-nginx/kube-system/app-routing-system\n"
-    # Warn but don't fail — controller might use different labels
+  if [[ -n "$gw_list" ]]; then
+    print_pass "No IngressClass, but Gateway API is installed and $(echo "$gw_list" | grep -c . ) Gateway object(s) exist — install with serviceType=gatewayAPI"
+    detail+="**Result:** PASS — Gateway API available with at least one Gateway\n"
+    record_result "F. Ingress / Gateway API" "✅ PASS" "$detail"
+    return 0
   fi
 
-  record_result "E. Ingress controller" "✅ PASS" "$detail"
+  print_warn "Gateway API is installed but no Gateway object exists — serviceType=gatewayAPI requires a Gateway created before installation"
+  detail+="**Result:** WARN — Gateway API CRDs present, no Gateway object to attach an HTTPRoute to\n"
+  record_result "F. Ingress / Gateway API" "⚠️ WARN" "$detail"
   return 0
 }
+export -f check_ingress
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK F — DNS domain
+# CHECK G — DNS domain
 # ═══════════════════════════════════════════════════════════════════════════════
 check_dns() {
-  print_header "F. DNS domain"
+  print_header "G. DNS domain"
 
   if [[ -z "$DOMAIN" ]]; then
     print_info "DNS check skipped (no domain configured)"
-    record_result "F. DNS domain" "⚠️ SKIP" "Domain not provided — check skipped."
+    record_result "G. DNS domain" "⚠️ SKIP" "Domain not provided — check skipped."
     return 0
   fi
 
@@ -682,30 +904,30 @@ check_dns() {
 
   if [[ -z "$resolved_ip" ]]; then
     print_warn "Domain '${DOMAIN}' does not resolve — DNS may not be configured yet"
-    record_result "F. DNS domain" "⚠️ WARN" "$detail"
+    record_result "G. DNS domain" "⚠️ WARN" "$detail"
     return 0
   fi
 
   if [[ -n "$all_lb_ips" ]] && ! echo "$all_lb_ips" | grep -qFx "$resolved_ip"; then
     print_warn "Domain '${DOMAIN}' resolves to ${resolved_ip} but doesn't match any cluster LB IP ($(echo "$all_lb_ips" | grep -v "^$" | tr '\n' ' '))"
     detail+="**Match:** WARN — ${resolved_ip} not among cluster LB IPs\n"
-    record_result "F. DNS domain" "⚠️ WARN" "$detail"
+    record_result "G. DNS domain" "⚠️ WARN" "$detail"
   else
     print_pass "Domain '${DOMAIN}' resolves to ${resolved_ip}"
     detail+="**Match:** PASS\n"
-    record_result "F. DNS domain" "✅ PASS" "$detail"
+    record_result "G. DNS domain" "✅ PASS" "$detail"
   fi
   return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK G — Registry reachability
+# CHECK H — Registry reachability
 # ═══════════════════════════════════════════════════════════════════════════════
 check_registry() {
-  print_header "G. Registry reachability"
+  print_header "H. Registry reachability"
 
   local pod_name="kcs-precheck-reg-${RANDOM}"
-  CLEANUP_NAMESPACE="default"
+  CLEANUP_NAMESPACE="$PROBE_NAMESPACE"
   CLEANUP_POD_NAME="$pod_name"
   local detail="" fail=0
 
@@ -714,7 +936,7 @@ check_registry() {
   kubectl run "$pod_name" \
     --image="$REGISTRY_TEST_IMAGE" \
     --restart=Never \
-    --namespace=default \
+    --namespace="$PROBE_NAMESPACE" \
     --overrides='{
       "spec": {
         "securityContext": {"runAsNonRoot": true, "runAsUser": 1000},
@@ -729,7 +951,7 @@ check_registry() {
 
   local elapsed=0 phase="" warned_pending=0
   while [[ $elapsed -lt $POD_POLL_TIMEOUT ]]; do
-    phase=$(kubectl get pod "$pod_name" -n default \
+    phase=$(kubectl get pod "$pod_name" -n "$PROBE_NAMESPACE" \
       -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
     case "$phase" in
       Succeeded|Failed) break ;;
@@ -748,41 +970,41 @@ check_registry() {
 
   if [[ "$phase" == "Succeeded" ]]; then
     local http_code
-    http_code=$(kubectl logs "$pod_name" -n default 2>/dev/null || echo "000")
+    http_code=$(kubectl logs "$pod_name" -n "$PROBE_NAMESPACE" 2>/dev/null || echo "000")
     detail+="**HTTP code:** ${http_code}\n"
 
     case "$http_code" in
       2??|3??|401|403)
         print_pass "Registry reachable — HTTP ${http_code}"
-        record_result "G. Registry reachability" "✅ PASS" "$detail"
+        record_result "H. Registry reachability" "✅ PASS" "$detail"
         return 0 ;;
       *)
         print_fail "Registry returned HTTP ${http_code}"
         detail+="**Result:** FAIL\n"
-        record_result "G. Registry reachability" "❌ FAIL" "$detail"
+        record_result "H. Registry reachability" "❌ FAIL" "$detail"
         return 1 ;;
     esac
   elif [[ "$phase" == "Failed" ]]; then
     local http_code
-    http_code=$(kubectl logs "$pod_name" -n default 2>/dev/null || echo "000")
+    http_code=$(kubectl logs "$pod_name" -n "$PROBE_NAMESPACE" 2>/dev/null || echo "000")
     detail+="**HTTP code:** ${http_code:-000}\n"
     print_fail "Registry unreachable — pod failed, HTTP ${http_code:-000}"
     detail+="**Result:** FAIL\n"
-    record_result "G. Registry reachability" "❌ FAIL" "$detail"
+    record_result "H. Registry reachability" "❌ FAIL" "$detail"
     return 1
   else
     print_warn "Pod did not complete within ${POD_POLL_TIMEOUT}s (phase: ${phase:-unknown})"
     detail+="**Result:** WARN — timed out\n"
-    record_result "G. Registry reachability" "⚠️ WARN" "$detail"
+    record_result "H. Registry reachability" "⚠️ WARN" "$detail"
     return 0
   fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK H — OS distribution and kernel version
+# CHECK I — OS distribution and kernel version
 # ═══════════════════════════════════════════════════════════════════════════════
 check_os_kernel() {
-  print_header "H. OS distribution and kernel version"
+  print_header "I. OS distribution and kernel version"
 
   local fail=0 detail=""
 
@@ -793,6 +1015,8 @@ check_os_kernel() {
 
   detail+="**Node OS and kernel info:**\n\`\`\`\n${node_info}\n\`\`\`\n"
 
+  detail+="**Tested kernels:** ${KERNEL_TESTED_VERSIONS// /, }\n"
+
   local has_warn=0
   while IFS=$'\t' read -r node_name os_image kernel_ver; do
     [[ -z "$node_name" ]] && continue
@@ -802,32 +1026,47 @@ check_os_kernel() {
       detail+="**${node_name}:** FAIL — kernel ${kernel_ver} < ${MIN_KERNEL_MAJOR}.${MIN_KERNEL_MINOR}\n"
       fail=1
     elif ! kernel_ge "$kernel_ver" "$WARN_KERNEL_MAJOR" "$WARN_KERNEL_MINOR"; then
+      # Below 5.8 the kernel lacks the process-privilege controls kcs-ih uses,
+      # so kcs-ih has to be installed in privileged mode instead.
       print_warn "Node ${node_name}: kernel ${kernel_ver} (${os_image}) — kernel < ${WARN_KERNEL_MAJOR}.${WARN_KERNEL_MINOR}, kcs-ih must run in privileged mode"
       detail+="**${node_name}:** WARN — kernel ${kernel_ver} ≥ ${MIN_KERNEL_MAJOR}.${MIN_KERNEL_MINOR} but < ${WARN_KERNEL_MAJOR}.${WARN_KERNEL_MINOR}, privileged mode required for kcs-ih\n"
       has_warn=1
+    elif ! version_in_list "$kernel_ver" "$KERNEL_TESTED_VERSIONS"; then
+      print_warn "Node ${node_name}: kernel ${kernel_ver} (${os_image}) — not in the tested kernel list; runtime profile monitoring is unverified on it"
+      detail+="**${node_name}:** WARN — kernel ${kernel_ver} is not in the tested list. Absence from the list is neither proof of incompatibility nor a guarantee of support.\n"
+      has_warn=1
     else
-      print_pass "Node ${node_name}: kernel ${kernel_ver} (${os_image})"
-      detail+="**${node_name}:** PASS — kernel ${kernel_ver} ≥ ${WARN_KERNEL_MAJOR}.${WARN_KERNEL_MINOR}\n"
+      print_pass "Node ${node_name}: kernel ${kernel_ver} (${os_image}) — tested"
+      detail+="**${node_name}:** PASS — kernel ${kernel_ver} is in the tested list\n"
     fi
+
+    # Astra Linux kernels need BTF compiled in, which the eBPF check verifies
+    # at runtime; name the option here so the requirement is in the report.
+    case "$os_image" in
+      *Astra*|*astra*)
+        print_info "Node ${node_name} runs Astra Linux — the kernel config must contain CONFIG_DEBUG_INFO_BTF=y"
+        detail+="**${node_name}:** note — Astra Linux requires CONFIG_DEBUG_INFO_BTF=y in the kernel config\n"
+        ;;
+    esac
   done <<< "$node_info"
 
   if [[ $fail -eq 0 ]] && [[ $has_warn -eq 1 ]]; then
-    record_result "H. OS and kernel version" "⚠️ WARN" "$detail"
+    record_result "I. OS and kernel version" "⚠️ WARN" "$detail"
     return 0
   elif [[ $fail -eq 0 ]]; then
-    record_result "H. OS and kernel version" "✅ PASS" "$detail"
+    record_result "I. OS and kernel version" "✅ PASS" "$detail"
     return 0
   else
-    record_result "H. OS and kernel version" "❌ FAIL" "$detail"
+    record_result "I. OS and kernel version" "❌ FAIL" "$detail"
     return 1
   fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK I — eBPF capabilities (BTF support)
+# CHECK J — eBPF capabilities (BTF support)
 # ═══════════════════════════════════════════════════════════════════════════════
 check_ebpf() {
-  print_header "I. eBPF capabilities (BTF support)"
+  print_header "J. eBPF capabilities (BTF support)"
 
   local fail=0 detail=""
   detail+="**Checking /sys/kernel/btf/vmlinux on each node (requires privileged pod)...**\n"
@@ -845,7 +1084,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: ${pod_name}
-  namespace: default
+  namespace: ${PROBE_NAMESPACE}
 spec:
   nodeName: ${node_name}
   restartPolicy: Never
@@ -869,7 +1108,7 @@ PODSPEC
 
     local elapsed=0 phase=""
     while [[ $elapsed -lt 90 ]]; do
-      phase=$(kubectl get pod "$pod_name" -n default \
+      phase=$(kubectl get pod "$pod_name" -n "$PROBE_NAMESPACE" \
         -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
       [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && break
       sleep 2; elapsed=$(( elapsed + 2 ))
@@ -877,9 +1116,9 @@ PODSPEC
 
     local btf_result=""
     [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && \
-      btf_result=$(kubectl logs "$pod_name" -n default 2>/dev/null || echo "")
+      btf_result=$(kubectl logs "$pod_name" -n "$PROBE_NAMESPACE" 2>/dev/null || echo "")
 
-    kubectl delete pod "$pod_name" -n default \
+    kubectl delete pod "$pod_name" -n "$PROBE_NAMESPACE" \
       --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true
 
     if [[ "$btf_result" == "BTF_OK" ]]; then
@@ -896,23 +1135,23 @@ PODSPEC
   done <<< "$node_names"
 
   if [[ $fail -eq 0 ]]; then
-    record_result "I. eBPF capabilities" "✅ PASS" "$detail"
+    record_result "J. eBPF capabilities" "✅ PASS" "$detail"
     return 0
   else
-    record_result "I. eBPF capabilities" "❌ FAIL" "$detail"
+    record_result "J. eBPF capabilities" "❌ FAIL" "$detail"
     return 1
   fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK J — External PostgreSQL database
+# CHECK K — External PostgreSQL database
 # ═══════════════════════════════════════════════════════════════════════════════
 check_external_db() {
-  print_header "J. External PostgreSQL database"
+  print_header "K. External PostgreSQL database"
 
   if [[ -z "${EXTERNAL_DB_HOST:-}" ]]; then
     print_info "External DB check skipped (--external-db not provided)"
-    record_result "J. External PostgreSQL" "⚠️ SKIP" "No external DB host specified — check skipped."
+    record_result "K. External PostgreSQL" "⚠️ SKIP" "No external DB host specified — check skipped."
     return 0
   fi
 
@@ -932,7 +1171,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: ${pod_name}
-  namespace: default
+  namespace: ${PROBE_NAMESPACE}
 spec:
   restartPolicy: Never
   containers:
@@ -941,13 +1180,13 @@ spec:
     env:
     - name: PGPASSWORD
       value: "${pass}"
-    command: ["sh", "-c", "if pg_isready -h ${host} -p ${port} -U ${user} -t 10 2>/dev/null; then if psql -h ${host} -p ${port} -U ${user} -c 'SELECT 1' postgres >/dev/null 2>&1; then echo DB_CONNECT_OK; else echo DB_CONNECT_FAIL_AUTH; fi; else echo DB_CONNECT_FAIL_NETWORK; fi"]
+    command: ["sh", "-c", "if pg_isready -h ${host} -p ${port} -U ${user} -t 10 2>/dev/null; then if psql -h ${host} -p ${port} -U ${user} -c 'SELECT 1' postgres >/dev/null 2>&1; then v=\$(psql -h ${host} -p ${port} -U ${user} -tAc 'SHOW server_version' postgres 2>/dev/null | head -1 | cut -d' ' -f1); echo DB_CONNECT_OK:\$v; else echo DB_CONNECT_FAIL_AUTH; fi; else echo DB_CONNECT_FAIL_NETWORK; fi"]
 PODSPEC
 
   local timeout="${DB_CHECK_TIMEOUT:-60}"
   local elapsed=0 phase=""
   while [[ $elapsed -lt $timeout ]]; do
-    phase=$(kubectl get pod "$pod_name" -n default \
+    phase=$(kubectl get pod "$pod_name" -n "$PROBE_NAMESPACE" \
       -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
     [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && break
     sleep 2; elapsed=$(( elapsed + 2 ))
@@ -955,57 +1194,89 @@ PODSPEC
 
   local result=""
   [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && \
-    result=$(kubectl logs "$pod_name" -n default 2>/dev/null | tail -1 || echo "")
+    result=$(kubectl logs "$pod_name" -n "$PROBE_NAMESPACE" 2>/dev/null | tail -1 || echo "")
 
-  kubectl delete pod "$pod_name" -n default \
+  kubectl delete pod "$pod_name" -n "$PROBE_NAMESPACE" \
     --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true
 
   detail+="**Pod phase:** ${phase:-timeout}\n"
 
-  if [[ "$result" == "DB_CONNECT_OK" ]]; then
+  if [[ "$result" == DB_CONNECT_OK:* ]]; then
+    local pg_ver pg_major
+    pg_ver="${result#DB_CONNECT_OK:}"
     print_pass "PostgreSQL at ${host}:${port} reachable, user '${user}' authenticated"
-    record_result "J. External PostgreSQL" "✅ PASS" "$detail"
+    detail+="**Connection:** PASS\n"
+    detail+="**Tested PostgreSQL versions:** ${POSTGRES_TESTED_VERSIONS// /, }\n"
+
+    if [[ -z "$pg_ver" ]]; then
+      print_warn "Connected, but the server version could not be read — verify it is one of ${POSTGRES_TESTED_VERSIONS// /, }"
+      detail+="**Server version:** WARN — could not be read\n"
+      record_result "K. External PostgreSQL" "⚠️ WARN" "$detail"
+      return 0
+    fi
+
+    detail+="**Server version:** ${pg_ver}\n"
+    pg_major="${pg_ver%%.*}"
+    pg_major="${pg_major//[^0-9]/}"
+
+    if [[ -z "$pg_major" ]] || [[ "$pg_major" -lt "$MIN_POSTGRES_MAJOR" ]]; then
+      print_fail "PostgreSQL ${pg_ver} — minimum major version ${MIN_POSTGRES_MAJOR} required"
+      detail+="**Version:** FAIL — below minimum major ${MIN_POSTGRES_MAJOR}\n"
+      record_result "K. External PostgreSQL" "❌ FAIL" "$detail"
+      return 1
+    fi
+
+    if version_in_list "$pg_ver" "$POSTGRES_TESTED_VERSIONS"; then
+      print_pass "PostgreSQL ${pg_ver} — tested with this KCS release"
+      detail+="**Version:** PASS — in the tested list\n"
+      record_result "K. External PostgreSQL" "✅ PASS" "$detail"
+      return 0
+    fi
+
+    print_warn "PostgreSQL ${pg_ver} — above the minimum but not in the tested list (${POSTGRES_TESTED_VERSIONS// /, }); confirm with Technical Support"
+    detail+="**Version:** WARN — not in the tested list\n"
+    record_result "K. External PostgreSQL" "⚠️ WARN" "$detail"
     return 0
   elif [[ "$result" == "DB_CONNECT_FAIL_NETWORK" ]]; then
     print_fail "Cannot reach PostgreSQL at ${host}:${port} — host unreachable or port closed"
     detail+="**Connection:** FAIL — network unreachable or port closed\n"
-    record_result "J. External PostgreSQL" "❌ FAIL" "$detail"
+    record_result "K. External PostgreSQL" "❌ FAIL" "$detail"
     return 1
   elif [[ "$result" == "DB_CONNECT_FAIL_AUTH" ]]; then
     print_fail "PostgreSQL at ${host}:${port} is reachable but authentication failed for user '${user}'"
     detail+="**Connection:** FAIL — authentication failed (wrong user or password)\n"
-    record_result "J. External PostgreSQL" "❌ FAIL" "$detail"
+    record_result "K. External PostgreSQL" "❌ FAIL" "$detail"
     return 1
   else
     print_warn "PostgreSQL check inconclusive — pod did not complete within ${timeout}s (phase: ${phase:-unknown})"
     detail+="**Connection:** WARN — pod timed out or image pull failed\n"
-    record_result "J. External PostgreSQL" "⚠️ WARN" "$detail"
+    record_result "K. External PostgreSQL" "⚠️ WARN" "$detail"
     return 0
   fi
 }
 export -f check_external_db
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK K — HashiCorp Vault
+# CHECK L — HashiCorp Vault
 # ═══════════════════════════════════════════════════════════════════════════════
 check_vault() {
-  print_header "K. HashiCorp Vault"
+  print_header "L. HashiCorp Vault"
 
   if [[ -z "${VAULT_HOST:-}" ]]; then
     print_info "Vault check skipped (--vault not provided)"
-    record_result "K. HashiCorp Vault" "⚠️ SKIP" "No Vault host specified — check skipped."
+    record_result "L. HashiCorp Vault" "⚠️ SKIP" "No Vault host specified — check skipped."
     return 0
   fi
 
   if [[ -z "${VAULT_ACCOUNT_FILE:-}" ]]; then
     print_fail "Vault account file not specified (--vault-account is required with --vault)"
-    record_result "K. HashiCorp Vault" "❌ FAIL" "No account file specified — use --vault-account."
+    record_result "L. HashiCorp Vault" "❌ FAIL" "No account file specified — use --vault-account."
     return 1
   fi
 
   if [[ ! -f "${VAULT_ACCOUNT_FILE}" ]]; then
     print_fail "Vault account file not found: ${VAULT_ACCOUNT_FILE}"
-    record_result "K. HashiCorp Vault" "❌ FAIL" "Account file not found: ${VAULT_ACCOUNT_FILE}"
+    record_result "L. HashiCorp Vault" "❌ FAIL" "Account file not found: ${VAULT_ACCOUNT_FILE}"
     return 1
   fi
 
@@ -1023,7 +1294,7 @@ check_vault() {
 
   if [[ -z "$vault_token" ]]; then
     print_fail "VAULT_TOKEN not found in ${VAULT_ACCOUNT_FILE}"
-    record_result "K. HashiCorp Vault" "❌ FAIL" "No VAULT_TOKEN entry in account file."
+    record_result "L. HashiCorp Vault" "❌ FAIL" "No VAULT_TOKEN entry in account file."
     return 1
   fi
 
@@ -1039,7 +1310,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: ${pod_name}
-  namespace: default
+  namespace: ${PROBE_NAMESPACE}
 spec:
   restartPolicy: Never
   containers:
@@ -1064,7 +1335,7 @@ PODSPEC
   local timeout="${VAULT_CHECK_TIMEOUT:-60}"
   local elapsed=0 phase=""
   while [[ $elapsed -lt $timeout ]]; do
-    phase=$(kubectl get pod "$pod_name" -n default \
+    phase=$(kubectl get pod "$pod_name" -n "$PROBE_NAMESPACE" \
       -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
     [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && break
     sleep 2; elapsed=$(( elapsed + 2 ))
@@ -1072,9 +1343,9 @@ PODSPEC
 
   local result=""
   [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && \
-    result=$(kubectl logs "$pod_name" -n default 2>/dev/null | tail -1 || echo "")
+    result=$(kubectl logs "$pod_name" -n "$PROBE_NAMESPACE" 2>/dev/null | tail -1 || echo "")
 
-  kubectl delete pod "$pod_name" -n default \
+  kubectl delete pod "$pod_name" -n "$PROBE_NAMESPACE" \
     --ignore-not-found=true --timeout=15s >/dev/null 2>&1 || true
 
   detail+="**Pod phase:** ${phase:-timeout}\n"
@@ -1082,37 +1353,37 @@ PODSPEC
   case "$result" in
     VAULT_OK)
       print_pass "Vault at ${vault_addr} is reachable and token is valid"
-      record_result "K. HashiCorp Vault" "✅ PASS" "$detail"
+      record_result "L. HashiCorp Vault" "✅ PASS" "$detail"
       return 0;;
     VAULT_UNREACHABLE)
       print_fail "Cannot reach Vault at ${vault_addr} — host unreachable or port closed"
       detail+="**Connection:** FAIL — network unreachable or port closed\n"
-      record_result "K. HashiCorp Vault" "❌ FAIL" "$detail"
+      record_result "L. HashiCorp Vault" "❌ FAIL" "$detail"
       return 1;;
     VAULT_SEALED)
       print_fail "Vault at ${vault_addr} is sealed — unseal Vault before installing KCS"
       detail+="**Connection:** FAIL — Vault is sealed\n"
-      record_result "K. HashiCorp Vault" "❌ FAIL" "$detail"
+      record_result "L. HashiCorp Vault" "❌ FAIL" "$detail"
       return 1;;
     VAULT_AUTH_FAIL)
       print_fail "Vault at ${vault_addr} is reachable but token authentication failed"
       detail+="**Connection:** FAIL — invalid or expired token\n"
-      record_result "K. HashiCorp Vault" "❌ FAIL" "$detail"
+      record_result "L. HashiCorp Vault" "❌ FAIL" "$detail"
       return 1;;
     *)
       print_warn "Vault check inconclusive — pod did not complete within ${timeout}s (phase: ${phase:-unknown})"
       detail+="**Result:** ${result:-timeout}\n"
-      record_result "K. HashiCorp Vault" "⚠️ WARN" "$detail"
+      record_result "L. HashiCorp Vault" "⚠️ WARN" "$detail"
       return 0;;
   esac
 }
 export -f check_vault
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK L — Container runtime
+# CHECK M — Container runtime
 # ═══════════════════════════════════════════════════════════════════════════════
 check_container_runtime() {
-  print_header "L. Container runtime"
+  print_header "M. Container runtime"
 
   local fail=0 detail=""
 
@@ -1144,24 +1415,21 @@ check_container_runtime() {
   done <<< "$runtime_info"
 
   if [[ $fail -eq 0 ]]; then
-    record_result "L. Container runtime" "✅ PASS" "$detail"
+    record_result "M. Container runtime" "✅ PASS" "$detail"
     return 0
   else
-    record_result "L. Container runtime" "❌ FAIL" "$detail"
+    record_result "M. Container runtime" "❌ FAIL" "$detail"
     return 1
   fi
 }
 export -f check_container_runtime
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK M — CNI plugin
+# CHECK N — CNI plugin
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Supported Cilium minor versions (space-separated major.minor pairs)
-CILIUM_SUPPORTED_VERSIONS="1.16 1.17 1.18"
-
 check_cni() {
-  print_header "M. CNI plugin"
+  print_header "N. CNI plugin"
 
   local detail="" cni_name="" cni_image="" cni_ns="" cni_version="" row
 
@@ -1176,16 +1444,24 @@ check_cni() {
     printf '%s\n' "${out%%$'\n'*}"
   }
 
-  # Try Calico
+  # Try Calico — versions are pinned by the documentation, including the
+  # patch level for the 3.22 line, so 3.22.1 is not covered by 3.22.5.
   row=$(_cni_row "calico-node")
   if [[ -n "$row" ]]; then
     cni_ns=$(awk -F'\t' '{print $1}' <<< "$row")
     cni_image=$(awk -F'\t' '{print $2}' <<< "$row")
     cni_name="Calico"
     cni_version="${cni_image##*:}"
-    print_pass "CNI: ${cni_name} ${cni_version} (image: ${cni_image})"
-    detail+="**CNI:** ${cni_name} ${cni_version} — PASS\n"
-    record_result "M. CNI plugin" "✅ PASS" "$detail"
+    detail+="**Tested Calico versions:** ${CALICO_TESTED_VERSIONS// /, }\n"
+    if version_in_list "${cni_version#v}" "$CALICO_TESTED_VERSIONS"; then
+      print_pass "CNI: ${cni_name} ${cni_version} (image: ${cni_image}) — tested"
+      detail+="**CNI:** ${cni_name} ${cni_version} — PASS (tested version)\n"
+      record_result "N. CNI plugin" "✅ PASS" "$detail"
+      return 0
+    fi
+    print_warn "CNI: ${cni_name} ${cni_version} — not in the tested list (${CALICO_TESTED_VERSIONS// /, }); confirm with Technical Support"
+    detail+="**CNI:** ${cni_name} ${cni_version} — WARN (not in the tested list)\n"
+    record_result "N. CNI plugin" "⚠️ WARN" "$detail"
     return 0
   fi
 
@@ -1196,9 +1472,10 @@ check_cni() {
     cni_image=$(awk -F'\t' '{print $2}' <<< "$row")
     cni_name="Flannel"
     cni_version="${cni_image##*:}"
+    # The documentation lists Flannel without a version constraint.
     print_pass "CNI: ${cni_name} ${cni_version} (image: ${cni_image})"
-    detail+="**CNI:** ${cni_name} ${cni_version} — PASS\n"
-    record_result "M. CNI plugin" "✅ PASS" "$detail"
+    detail+="**CNI:** ${cni_name} ${cni_version} — PASS (no version constraint documented)\n"
+    record_result "N. CNI plugin" "✅ PASS" "$detail"
     return 0
   fi
 
@@ -1212,19 +1489,21 @@ check_cni() {
     local ver="${cni_version#v}"
     local major="${ver%%.*}"; local rest="${ver#*.}"; local minor="${rest%%.*}"
     local major_minor="${major}.${minor}"
-    local supported=0
-    for mv in $CILIUM_SUPPORTED_VERSIONS; do
-      [[ "$mv" == "$major_minor" ]] && supported=1
-    done
-    if [[ $supported -eq 1 ]]; then
+    detail+="**Supported Cilium versions:** ${CILIUM_TESTED_VERSIONS// /, }\n"
+    if version_in_list "$major_minor" "$CILIUM_TESTED_VERSIONS"; then
       print_pass "CNI: ${cni_name} ${cni_version} (image: ${cni_image})"
       detail+="**CNI:** ${cni_name} ${cni_version} — PASS (supported version)\n"
-      record_result "M. CNI plugin" "✅ PASS" "$detail"
+      # Cilium 1.16 needs enableTCX=false; later supported minors do not.
+      if [[ "$major_minor" == "1.16" ]]; then
+        print_info "Cilium 1.16 requires enableTCX=false in the Cilium configuration"
+        detail+="**Cilium 1.16:** note — set enableTCX=false\n"
+      fi
+      record_result "N. CNI plugin" "✅ PASS" "$detail"
       return 0
     else
-      print_fail "CNI: ${cni_name} ${cni_version} — only versions 1.16, 1.17, and 1.18 are supported by KCS 2.4"
-      detail+="**CNI:** ${cni_name} ${cni_version} — FAIL (unsupported version; supported: 1.16, 1.17, 1.18)\n"
-      record_result "M. CNI plugin" "❌ FAIL" "$detail"
+      print_fail "CNI: ${cni_name} ${cni_version} — only versions ${CILIUM_TESTED_VERSIONS// /, } are supported by this KCS release"
+      detail+="**CNI:** ${cni_name} ${cni_version} — FAIL (unsupported version; supported: ${CILIUM_TESTED_VERSIONS// /, })\n"
+      record_result "N. CNI plugin" "❌ FAIL" "$detail"
       return 1
     fi
   fi
@@ -1232,10 +1511,144 @@ check_cni() {
   # No known CNI found
   print_warn "CNI: no known CNI detected (checked Calico, Flannel, Cilium) — verify CNI compatibility manually"
   detail+="**CNI:** unknown — WARN (no Calico/Flannel/Cilium daemonset found)\n"
-  record_result "M. CNI plugin" "⚠️ WARN" "$detail"
+  record_result "N. CNI plugin" "⚠️ WARN" "$detail"
   return 0
 }
 export -f check_cni
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHECK O — Helm package manager
+#
+# KCS is installed with a Helm chart, so the Helm client decides whether the
+# install can proceed at all. The check is advisory when helm is missing: the
+# script may legitimately run from a host that only has kubectl.
+# ═══════════════════════════════════════════════════════════════════════════════
+check_helm() {
+  print_header "O. Helm package manager"
+
+  local detail="" raw ver major
+
+  if ! command -v helm >/dev/null 2>&1; then
+    print_info "helm not found on PATH — skipping (installation needs Helm ${HELM_TESTED_VERSIONS// /, })"
+    record_result "O. Helm" "⚠️ SKIP" \
+      "helm is not available on this host, so the client version was not verified. Installation requires Helm ${HELM_TESTED_VERSIONS// /, }."
+    return 0
+  fi
+
+  raw=$(helm version --short 2>/dev/null || echo "")
+  # "v3.21.1+gabc1234" → "3.21.1"
+  ver="${raw#v}"
+  ver="${ver%%+*}"
+  detail+="**helm version --short:** ${raw:-(no output)}\n"
+  detail+="**Tested Helm versions:** ${HELM_TESTED_VERSIONS// /, }\n"
+
+  if [[ -z "$ver" ]]; then
+    print_warn "Could not read the Helm version — verify it is one of ${HELM_TESTED_VERSIONS// /, }"
+    detail+="**Result:** WARN — version unreadable\n"
+    record_result "O. Helm" "⚠️ WARN" "$detail"
+    return 0
+  fi
+
+  major="${ver%%.*}"
+  major="${major//[^0-9]/}"
+
+  if [[ -z "$major" ]] || [[ "$major" -lt "$MIN_HELM_MAJOR" ]]; then
+    print_fail "Helm ${ver} — Helm ${MIN_HELM_MAJOR} or later is required to install KCS"
+    detail+="**Result:** FAIL — major version below ${MIN_HELM_MAJOR}\n"
+    record_result "O. Helm" "❌ FAIL" "$detail"
+    return 1
+  fi
+
+  if version_in_list "$ver" "$HELM_TESTED_VERSIONS"; then
+    print_pass "Helm ${ver} — tested with this KCS release"
+    detail+="**Result:** PASS — in the tested list\n"
+    record_result "O. Helm" "✅ PASS" "$detail"
+    return 0
+  fi
+
+  print_warn "Helm ${ver} — usable but not in the tested list (${HELM_TESTED_VERSIONS// /, })"
+  detail+="**Result:** WARN — not in the tested list\n"
+  record_result "O. Helm" "⚠️ WARN" "$detail"
+  return 0
+}
+export -f check_helm
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHECK P — Agent resource headroom
+#
+# The agents are sized on top of the core requirements, not inside them:
+#   kube-agent — one per serviced cluster, 1 core per 2500 pods and 2 GB per
+#                3000 pods.
+#   node-agent — a DaemonSet, so 0.3 core / 300 MB per node at the base, and
+#                up to 3 cores / 5 GB per node once every optional feature is
+#                enabled. A node that cannot hold the maximum footprint will
+#                limit which runtime features can be switched on.
+# ═══════════════════════════════════════════════════════════════════════════════
+check_agent_resources() {
+  print_header "P. Agent resource headroom"
+
+  local detail="" warn=0 fail=0
+  local pod_count node_count=0 ka_cores ka_mem_gb
+
+  pod_count=$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | grep -c . || true)
+  [[ -z "$pod_count" ]] && pod_count=0
+
+  ka_cores=$(kube_agent_cores "$pod_count")
+  ka_mem_gb=$(kube_agent_mem_gb "$pod_count")
+
+  detail+="**Pods in cluster:** ${pod_count}\n"
+  detail+="**kube-agent requirement:** ${ka_cores} core(s), ${ka_mem_gb} GB (1 core per ${KUBE_AGENT_PODS_PER_CORE} pods, 2 GB per ${KUBE_AGENT_PODS_PER_2GB} pods)\n"
+  detail+="**node-agent requirement per node:** ${NODE_AGENT_BASE_MILLICORES}m / ${NODE_AGENT_BASE_MIB} MiB base, up to ${NODE_AGENT_MAX_MILLICORES}m / ${NODE_AGENT_MAX_MIB} MiB with all features enabled\n\n"
+
+  print_info "Cluster holds ${pod_count} pod(s) — kube-agent needs ${ka_cores} core(s) and ${ka_mem_gb} GB"
+
+  # Build a "<node><TAB><cpu millicores><TAB><memory MiB>" view of the workers.
+  local cpu_rows mem_rows node_name value
+  _worker_node_rows '{.status.allocatable.cpu}'
+  cpu_rows="$WORKER_NODE_ROWS"
+  _worker_node_rows '{.status.allocatable.memory}'
+  mem_rows="$WORKER_NODE_ROWS"
+
+  while IFS=$'\t' read -r node_name value; do
+    [[ -z "$node_name" ]] && continue
+    node_count=$(( node_count + 1 ))
+
+    local mc mib mem_value
+    mc=$(normalize_cpu "$value")
+    mem_value=$(printf '%s\n' "$mem_rows" | grep "^${node_name}"$'\t' | head -1 | cut -f2)
+    mib=$(normalize_mem_mib "${mem_value:-0}")
+
+    if [[ "$mc" -ge "$NODE_AGENT_MAX_MILLICORES" ]] && [[ "$mib" -ge "$NODE_AGENT_MAX_MIB" ]]; then
+      print_pass "Node ${node_name}: ${mc}m / ${mib} MiB — fits node-agent at its maximum footprint"
+      detail+="**${node_name}:** PASS — ${mc}m / ${mib} MiB\n"
+    else
+      print_warn "Node ${node_name}: ${mc}m / ${mib} MiB — cannot hold node-agent at its maximum footprint (${NODE_AGENT_MAX_MILLICORES}m / ${NODE_AGENT_MAX_MIB} MiB); some runtime features may not fit"
+      detail+="**${node_name}:** WARN — ${mc}m / ${mib} MiB below the node-agent maximum\n"
+      warn=1
+    fi
+  done <<< "$cpu_rows"
+
+  if [[ "$node_count" -eq 0 ]]; then
+    print_fail "kubectl returned no node data — agent sizing could not be checked"
+    detail+="**Result:** FAIL — no node data returned\n"
+    record_result "P. Agent resources" "❌ FAIL" "$detail"
+    return 1
+  fi
+
+  detail+="\nTotal node-agent base across ${node_count} node(s): $(( node_count * NODE_AGENT_BASE_MILLICORES ))m / $(( node_count * NODE_AGENT_BASE_MIB )) MiB.\n"
+  detail+="These figures sit on top of the per-worker core requirements and exclude the customer's own workloads.\n"
+
+  if [[ $fail -eq 1 ]]; then
+    record_result "P. Agent resources" "❌ FAIL" "$detail"
+    return 1
+  elif [[ $warn -eq 1 ]]; then
+    record_result "P. Agent resources" "⚠️ WARN" "$detail"
+    return 0
+  fi
+  record_result "P. Agent resources" "✅ PASS" "$detail"
+  return 0
+}
+export -f check_agent_resources
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
@@ -1243,7 +1656,7 @@ export -f check_cni
 print_summary() {
   echo ""
   echo -e "${_BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${_RESET}"
-  echo -e "${_BOLD}  KCS 2.4 Pre-installation Check Summary${_RESET}"
+  echo -e "${_BOLD}  KCS 2.5.1 Pre-installation Check Summary${_RESET}"
   echo -e "${_BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${_RESET}"
 
   local has_fail=0 has_warn=0
@@ -1304,7 +1717,7 @@ main() {
 
   echo -e "${_BOLD}"
   echo "  ╔══════════════════════════════════════════════════╗"
-  echo "  ║   KCS 2.4 Kubernetes Pre-Installation Checker   ║"
+  echo "  ║  KCS 2.5.1 Kubernetes Pre-Installation Checker  ║"
   echo "  ╚══════════════════════════════════════════════════╝"
   echo -e "${_RESET}"
 
@@ -1312,19 +1725,22 @@ main() {
   gather_inputs
   init_report
 
-  check_k8s_version || true
-  check_cpu         || true
-  check_memory      || true
-  check_storage     || true
-  check_ingress     || true
-  check_dns         || true
+  check_k8s_version        || true
+  check_cpu                || true
+  check_memory             || true
+  check_storage_capacity   || true
+  check_storage            || true
+  check_ingress            || true
+  check_dns                || true
   [[ -z "$SKIP_REGISTRY_CHECK" ]] && { check_registry || true; }
-  check_os_kernel   || true
-  check_ebpf        || true
+  check_os_kernel          || true
+  check_ebpf               || true
   check_external_db        || true
   check_vault              || true
   check_container_runtime  || true
   check_cni                || true
+  check_helm               || true
+  check_agent_resources    || true
 
   print_summary
 

@@ -1,0 +1,7 @@
+# Generated pre-check reports
+kcs-precheck-*.md
+
+# Local tooling
+.claude/
+openspec/
+.code-review-graph/

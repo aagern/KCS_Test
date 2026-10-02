@@ -5,3 +5,6 @@ kcs-precheck-*.md
 .claude/
 openspec/
 .code-review-graph/
+
+# Local working notes — operator workflow and demo-lab pointers, never published
+NOTES.local.md
